@@ -35,6 +35,9 @@
     .tyre-badge { display:inline-flex; align-items:center; gap:4px; justify-content:center; }
     .tyre-ring { width:22px; height:22px; border-radius:50%; border:2px solid currentColor; display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:600; }
     .standings td.speed-cell { width:120px; }
+    .standings tbody tr { cursor:pointer; }
+    .standings tbody tr.focus { background:rgba(105, 226, 255, 0.12); }
+    .standings tbody tr.focus td { color:var(--text); }
     .speed-bar { position:relative; height:20px; border:1px solid #2a3240; border-radius:6px; overflow:hidden; background:#1a2028; }
     .speed-bar::before { content:''; position:absolute; inset:0; width:var(--pct,0%); background:linear-gradient(90deg, rgba(123,216,143,0.35), rgba(123,216,143,0.75)); }
     .speed-bar span { position:relative; display:block; text-align:center; line-height:18px; font-size:12px; color:var(--text); }
@@ -310,6 +313,18 @@
   let segmentState = { source:'', index:-1, lap:null };
   canvas.addEventListener('pointermove', handleSegmentPointer);
   canvas.addEventListener('pointerleave', handleSegmentLeave);
+  tbl.addEventListener('click', (evt) => {
+    const row = evt.target.closest('tr[data-driver]');
+    if (!row) return;
+    const id = Number(row.dataset.driver);
+    if (!Number.isFinite(id)) return;
+    if (cameraState.targetId !== id) {
+      cameraState.targetId = id;
+      isHoveringSegment = false;
+      updateSegmentInfoForPlayer();
+      updateStatus();
+    }
+  });
 
   function resize() {
     const rect = canvas.parentElement.getBoundingClientRect();
@@ -331,6 +346,7 @@
     height: 0,
     centerY: 0,
     dpr: 1,
+    targetId: 0,
   };
 
   function applyGridPositions(list) {
@@ -484,9 +500,10 @@
 
     // drivers
     const laneJitter = laneWidth * 0.45;
-    let playerPoint = null;
+    let focusPoint = null;
     for (let i=0;i<drivers.length;i++) {
       const d = drivers[i];
+      const isFocus = focus && d.id === focus.id;
       const lateralOffset = lateralOffsets.get(d.id) ?? 0;
       const xi = clamp(trackX + lateralOffset, trackX - trackHalf + 6 * dpr, trackX + trackHalf - 6 * dpr);
       const yRaw = absPosToScreenY(d.pos);
@@ -494,25 +511,27 @@
       const offscreen = yRaw < pad || yRaw > h - pad;
       ctx.beginPath();
       ctx.fillStyle = d.color;
-      ctx.globalAlpha = offscreen && d.id !== 0 ? 0.45 : 1;
+      ctx.globalAlpha = offscreen && !isFocus ? 0.45 : 1;
       ctx.arc(xi, yClamped, 6 * dpr, 0, Math.PI*2);
       ctx.fill();
       ctx.globalAlpha = 1;
       const totalPos = d.finished ? TOTAL_LENGTH_M : clamp(d.pos, 0, TOTAL_LENGTH_M);
       const laneY = mapTotalProgressToY(totalPos, h, pad);
-      const laneNoise = d.id === 0 ? 0 : (((i*6131) % 100)/100 - 0.5);
+      const laneNoise = isFocus ? 0 : (((i*6131) % 100)/100 - 0.5);
       const laneXi = laneCenter + laneNoise * laneJitter;
       ctx.beginPath();
       ctx.fillStyle = d.color;
       ctx.arc(laneXi, laneY, 4.5 * dpr, 0, Math.PI*2);
       ctx.fill();
-      if (d.id === 0) {
-        playerPoint = { x: xi, y: yClamped };
+      if (isFocus) {
+        focusPoint = { x: xi, y: yClamped };
       }
     }
 
-    if (player && playerPoint) {
-      drawPlayerCallout(playerPoint.x, playerPoint.y, player.color);
+    if (focus && focusPoint) {
+      const bubbleColor = focus.color || getCSS('--accent') || '#69e2ff';
+      const label = focus.isPlayer ? 'You' : focus.name;
+      drawPlayerCallout(focusPoint.x, focusPoint.y, bubbleColor, label);
     }
 
     ctx.fillStyle = '#b3c1d1';
@@ -597,9 +616,8 @@
     }
   }
 
-  function drawPlayerCallout(px, py, playerColor) {
+  function drawPlayerCallout(px, py, playerColor, label = 'You') {
     const dpr = window.devicePixelRatio || 1;
-    const label = 'You';
     const paddingX = 14 * dpr;
     const paddingY = 8 * dpr;
     const pointerHalf = 8 * dpr;
@@ -860,6 +878,7 @@
   // ---- CORE LOOP ----
   let drivers = Array.from({length:DRIVERS}, (_,i)=>makeDriver(i));
   applyGridPositions(drivers);
+  cameraState.targetId = drivers[0]?.id ?? 0;
   let started = false, finished = false, paused = false;
   let simTime = 0;          // s (scaled by simSpeed)
   let lastT = 0, acc = 0;   // accumulator for fixed-step
@@ -1022,6 +1041,7 @@
     const order = [...drivers].sort((a,b)=>b.pos - a.pos || (a.finishTime??Infinity) - (b.finishTime??Infinity));
     const lead = order[0];
     const leadTimeNow = currentElapsedTime(lead, simTime);
+    const focusId = cameraState.targetId ?? (drivers[0]?.id ?? 0);
     tbl.innerHTML = order.map((d,idx)=>{
       let gap = '—';
       const driverTimeNow = currentElapsedTime(d, simTime);
@@ -1054,9 +1074,14 @@
       const maxPossible = Math.max(1, (d.carStats?.topSpeed ?? 360) * (d.driverStats?.topSpeed ?? 1));
       const pct = Math.min(100, Math.round((spd / maxPossible) * 100));
       const flag = `<span class="flag">${d.flag || '🏁'}</span>`;
-      const name = d.id === 0
-        ? `<strong style="color:var(--player)">${d.name}</strong>`
-        : `<strong>${d.name}</strong>`;
+      const isFocus = d.id === focusId;
+      let name = `<strong>${d.name}</strong>`;
+      if (d.id === 0) {
+        name = `<strong style="color:var(--player)">${d.name}</strong>`;
+      }
+      if (isFocus && d.id !== 0) {
+        name = `<strong style="color:var(--accent)">${d.name}</strong>`;
+      }
       const playerTeam = drivers[0]?.team;
       const isPlayerTeam = d.team && d.team === playerTeam;
       const teamColor = isPlayerTeam ? 'var(--player)' : (d.teamColor || '#93a1b3');
@@ -1079,7 +1104,8 @@
       }
       const lapSummary = formatLapSummary(d);
       const speedBar = `<div class="speed-bar" style="--pct:${pct}%"><span>${spdDisplay}</span></div>`;
-      return `<tr><td>${idx+1}</td><td>${flag}${name}${teamLine}</td><td>${gap}</td><td class="tyre-cell">${tyreCell}</td><td class="speed-cell">${speedBar}</td><td>${lapSummary}</td></tr>`;
+      const rowClass = isFocus ? ' class="focus"' : '';
+      return `<tr data-driver="${d.id}"${rowClass}><td>${idx+1}</td><td>${flag}${name}${teamLine}</td><td>${gap}</td><td class="tyre-cell">${tyreCell}</td><td class="speed-cell">${speedBar}</td><td>${lapSummary}</td></tr>`;
     }).join('');
   }
 
@@ -1117,6 +1143,7 @@
   function startRace() {
     if (started || finished) return;
     applyGridPositions(drivers);
+    cameraState.targetId = drivers[0]?.id ?? cameraState.targetId ?? 0;
     started = true;
     paused = false;
     finished = false;
@@ -1168,6 +1195,7 @@
   function restartRace() {
     drivers = Array.from({length:DRIVERS}, (_,i)=>makeDriver(i));
     applyGridPositions(drivers);
+    cameraState.targetId = drivers[0]?.id ?? cameraState.targetId ?? 0;
     fastestLapTime = Infinity;
     started = false;
     finished = false;
