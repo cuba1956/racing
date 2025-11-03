@@ -10,7 +10,7 @@
       --accent:#69e2ff; --player:#ff6ad5; --ok:#7bd88f; --warn:#ffafcc; --bad:#ff6b6b;
     }
     html,body { height:100%; margin:0; background:var(--bg); color:var(--text); font:14px/1.3 system-ui, Segoe UI, Roboto, Helvetica, Arial, Apple Color Emoji, Noto Color Emoji, sans-serif; }
-    .app { display:grid; grid-template-columns: 1fr 640px; gap:16px; height:100%; }
+    .app { display:grid; grid-template-columns: minmax(0,30%) minmax(0,70%); gap:16px; height:100%; }
     header { grid-column:1 / -1; padding:10px 14px; background:var(--panel); border-bottom:1px solid #232a33; display:flex; align-items:center; gap:12px; position:sticky; top:0; z-index:2; }
     header h1 { font-size:16px; margin:0; font-weight:600; letter-spacing:0.2px; }
     header .spacer { flex:1; }
@@ -27,20 +27,29 @@
     .segment-info .segment-meta { display:flex; flex-direction:column; gap:2px; }
     .side { display:flex; flex-direction:column; gap:12px; padding:12px; }
     .card { background:var(--panel); border:1px solid #232a33; border-radius:12px; padding:10px; }
-    .standings table { width:100%; border-collapse:collapse; }
+    .standings table { width:100%; border-collapse:collapse; user-select:text; }
     .standings th, .standings td { padding:6px 4px; border-bottom:1px solid #222a33; text-align:left; }
-    .standings td.tyre-cell, .standings th:nth-child(4) { text-align:center; width:110px; }
+    .standings td.tyre-cell, .standings th:nth-child(4) { text-align:center; }
     .in-pit { color:#69e2ff; font-weight:600; }
     .pit-time { color:#bd93f9; font-weight:600; }
     .tyre-badge { display:inline-flex; align-items:center; gap:4px; justify-content:center; }
     .tyre-ring { width:22px; height:22px; border-radius:50%; border:2px solid currentColor; display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:600; }
     .standings td.speed-cell { width:120px; }
+    .standings td.overtake-cell { text-align:center; font-variant-numeric:tabular-nums; }
     .standings tbody tr { cursor:pointer; }
     .standings tbody tr.focus { background:rgba(105, 226, 255, 0.12); }
     .standings tbody tr.focus td { color:var(--text); }
+    .pos-change { font-size:11px; font-weight:600; margin-left:6px; }
+    .pos-change.up { color:var(--ok); }
+    .pos-change.down { color:var(--bad); }
     .speed-bar { position:relative; height:20px; border:1px solid #2a3240; border-radius:6px; overflow:hidden; background:#1a2028; }
     .speed-bar::before { content:''; position:absolute; inset:0; width:var(--pct,0%); background:linear-gradient(90deg, rgba(123,216,143,0.35), rgba(123,216,143,0.75)); }
     .speed-bar span { position:relative; display:block; text-align:center; line-height:18px; font-size:12px; color:var(--text); }
+    .engagement-stats { display:flex; justify-content:center; gap:6px; font-size:12px; }
+    .engagement-stats span { display:inline-block; }
+    .engagement-stats .success { color:var(--ok); }
+    .engagement-stats .fail { color:var(--bad); }
+    .engagement-stats .sep { color:var(--muted); }
     .pill { display:inline-block; padding:2px 6px; border-radius:999px; font-size:12px; border:1px solid #2a3240; }
     .pill.straight { background:#0e3b2a; color:#b6ffd3; }
     .pill.corner  { background:#3b1a0e; color:#ffd2b6; }
@@ -92,7 +101,7 @@
       <div class="card standings">
         <strong>Standings</strong>
         <table id="tbl">
-          <thead><tr><th>#</th><th>Driver</th><th>Interval (s)</th><th>Tyre (%)</th><th>Speed (km/h)</th><th>Lap (last / best)</th></tr></thead>
+          <thead><tr><th>#</th><th>Driver</th><th>Interval (s)</th><th>Tyre (%)</th><th>Engagements</th><th>Speed (km/h)</th><th>Lap (last / best)</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -139,6 +148,10 @@
   const GRID_SPACING_M = 10;
   const GRID_LANE_FACTOR = 0.6;
   const TYRE_DEGRADE_PER_M = 1/12000;
+  const OVERTAKE_SUCCESS_EPS = 0.5;
+  const OVERTAKE_GAP_THRESHOLD = 6;
+  const OVERTAKE_SUCCESS_PENALTY = { strength: 0.12, duration: 1.2 };
+  const OVERTAKE_FAIL_PENALTY = { strength: 0.10, duration: 1.0 };
   const tyreCompounds = {
     hard:   { wear: 1.0, grip: 1.0, accel: 1.0 },
     medium: { wear: 1.5, grip: 1.05, accel: 1.05 },
@@ -160,51 +173,55 @@
   let fastestLapTime = Infinity;
 
   function chooseCompound(team) {
-    const mapping = {
-      'Oracle Red Bull Racing':'soft',
-      'McLaren F1 Team':'soft',
-      'Scuderia Ferrari':'soft',
-      'Mercedes-AMG Petronas':'medium',
-      'Aston Martin Aramco':'medium',
-      'BWT Alpine F1 Team':'medium',
-      'RB F1 Team':'medium',
-      'Williams Racing':'hard',
-      'MoneyGram Haas F1':'hard',
-      'Stake F1 Team Kick Sauber':'hard'
-    };
-    return mapping[team] || 'hard';
+    return 'medium';
   }
+
+  const teamCarModifiers = {
+    'McLaren F1 Team':         { top: 1.015, accel: 1.01, handling: 1.01 },
+    'Oracle Red Bull Racing':  { top: 0.992, accel: 0.99, handling: 0.995 }
+  };
 
   // Track segments: start/end in metres
   const segments = [
     seg('straight', 0, 600),
-    seg('corner',   600, 900, 0.58),
+    seg('corner',   600, 900, 0.58, 0.90),
     seg('straight', 900, 1500),
-    seg('chicane',  1500, 1650, 0.52),
-    seg('straight', 1650, 2100),
-    seg('corner',   2100, 2500, 0.62),
+    seg('chicane',  1500, 1650, 0.52, 0.85),
+    seg('straight', 1650, 2100, 1.0, 1.05, true),
+    seg('corner',   2100, 2500, 0.62, 0.90),
     seg('straight', 2500, 3200),
-    seg('corner',   3200, 3600, 0.57),
-    seg('straight', 3600, 4200),
-    seg('chicane',  4200, 4350, 0.50),
-    seg('straight', 4350, TRACK_LENGTH_M)
+    seg('corner',   3200, 3600, 0.57, 0.88),
+    seg('corner',   3600, 3875, 0.55, 0.87),
+    seg('corner',   3875, 4150, 0.58, 0.89),
+    seg('straight', 4150, TRACK_LENGTH_M, 1.0, 1.05, true)
   ];
-  function seg(type, start, end, grip) {
-    return { type, start, end, grip: (type === 'straight') ? 1.0 : (grip ?? 0.6), overtake: type === 'straight' };
+  function seg(type, start, end, grip, overtakeDifficulty, drsZone=false) {
+    const baseGrip = (type === 'straight') ? 1.0 : (grip ?? 0.6);
+    let difficulty = overtakeDifficulty;
+    if (difficulty == null) {
+      if (type === 'corner') difficulty = 0.9;
+      else if (type === 'chicane') difficulty = 0.85;
+      else difficulty = 1;
+    }
+    return { type, start, end, grip: baseGrip, overtake: type === 'straight', difficulty, drs: !!drsZone };
   }
   // ---- DRIVER MODEL ----
   const maxPoints = Math.max(...driverSeed.map(d => d.points));
   const MIN_FACTOR = 0.99;
   const MAX_FACTOR = 1.00;
+  function balanceSkill(value, factor = 0.80) {
+    const v = Number.isFinite(value) ? value : 0.5;
+    return 0.5 + (v - 0.5) * factor;
+  }
   function perfFactor(form){ return clamp(MIN_FACTOR + (MAX_FACTOR - MIN_FACTOR)*form, MIN_FACTOR, MAX_FACTOR); }
   function makeDriver(i) {
     const data = driverSeed[i];
     const isPlayer = !!data.isPlayer;
     const form = maxPoints > 0 ? clamp(data.points / maxPoints, 0, 1) : 0.5;
-    const straightFocus = clamp(data.straight ?? form, 0, 1);
-    const cornerFocus = clamp(data.corner ?? form, 0, 1);
-    const racecraft = clamp(data.racecraft ?? form, 0, 1);
-    const driverFocus = clamp(data.driver ?? form, 0, 1);
+    const straightFocus = clamp(balanceSkill(data.straight ?? form), 0, 1);
+    const cornerFocus = clamp(balanceSkill(data.corner ?? form), 0, 1);
+    const racecraft = clamp(balanceSkill(data.racecraft ?? form), 0, 1);
+    const driverFocus = clamp(balanceSkill(data.driver ?? form), 0, 1);
     const carTopFactor = perfFactor(lerp(form, straightFocus, 0.4));
     const carAccelFactor = perfFactor(lerp(form, racecraft, 0.3));
     const carHandlingFactor = perfFactor(lerp(form, cornerFocus, 0.5));
@@ -233,7 +250,8 @@
       tyreWearMult: compound.wear ?? 1
     };
     applyCompoundToCar(carStats, compoundKey);
-    const defenceFocus = clamp(data.defence ?? data.defense ?? racecraft, 0, 1);
+    applyTeamModifiers(carStats, data.team);
+    const defenceFocus = clamp(balanceSkill(data.defence ?? data.defense ?? racecraft), 0, 1);
     const driverRacecraft = clamp01(lerp(racecraft, form, 0.3));
     const driverDefense = clamp01(lerp(defenceFocus, form, 0.35));
     const driverStats = {
@@ -277,6 +295,17 @@
       pitStats: teamPit,
       pitLapDisplay: 0,
       lastPitService: null,
+      overtakePenalty: 0,
+      overtakeTimer: 0,
+      overtakeTotal: 0,
+      overtakeSuccess: 0,
+      overtakeFail: 0,
+      segmentType: segments[0]?.type || 'straight',
+      isDNF: false,
+      overtakeBoostAccel: 0,
+      overtakeBoostTop: 0,
+      overtakeBoostTimer: 0,
+      intervalDisplay: '—',
     };
   }
   function currentSegment(x) {
@@ -351,13 +380,32 @@
 
   function applyGridPositions(list) {
     const total = list.length;
-    let nextSlot = 0;
-    const lastSlot = total - 1;
+    const slots = Array.from({length: total}, (_,i)=>i);
+    const reserved = new Map();
+    const lastSlot = slots[slots.length - 1];
+    const reserveSlot = (driver, fallbackSlot) => {
+      if (!driver) return;
+      const slot = fallbackSlot ?? slots[slots.length - 1];
+      const index = slots.indexOf(slot);
+      if (index !== -1) slots.splice(index, 1);
+      reserved.set(driver.id, slot);
+    };
+    const maxDriver = list.find(d => d.code === 'VER');
+    if (maxDriver) {
+      const targetSlot = Math.min(lastSlot, 4);
+      reserveSlot(maxDriver, targetSlot);
+    }
+    const playerDriver = list.find(d => d.isPlayer && (!maxDriver || d.id !== maxDriver.id));
+    if (playerDriver) {
+      const fallback = slots.length ? slots[slots.length - 1] : lastSlot - 1;
+      reserveSlot(playerDriver, fallback);
+    }
     for (let i=0;i<total;i++) {
       const d = list[i];
-      const slot = d.isPlayer ? lastSlot : nextSlot++;
+      const slot = reserved.has(d.id) ? reserved.get(d.id) : (slots.length ? slots.shift() : 0);
       const isSoloLastRow = (total % 2 === 1) && slot === lastSlot && slot % 2 === 0;
       const lane = isSoloLastRow ? 0 : (slot % 2 === 0 ? -1 : 1);
+      d.startSlot = slot;
       d.pos = -slot * GRID_SPACING_M;
       d.v = 0;
       d.finished = false;
@@ -880,7 +928,7 @@
   applyGridPositions(drivers);
   cameraState.targetId = drivers[0]?.id ?? 0;
   let started = false, finished = false, paused = false;
-  let simTime = 0;          // s (scaled by simSpeed)
+  let simTime = 0;          // simulated race time in seconds
   let lastT = 0, acc = 0;   // accumulator for fixed-step
   updateSegmentInfoForPlayer();
 
@@ -889,7 +937,7 @@
     while (acc >= TICK_RATE) {
       integrate(TICK_RATE);
       acc -= TICK_RATE;
-      simTime += TICK_RATE * simSpeed;
+      simTime += TICK_RATE;
       if (paused) {
         acc = 0;
         break;
@@ -899,11 +947,17 @@
 
   function integrate(dt) {
     let allDone = true;
-    const stepTime = dt * simSpeed;
+    const intervalUpdates = new Set();
+    const stepTime = dt;
     const timeAfterStep = simTime + stepTime;
     const positionOrder = [...drivers].sort((a,b)=>b.pos - a.pos);
+    const aheadMap = new Map();
+    for (let i=1; i<positionOrder.length; i++) {
+      aheadMap.set(positionOrder[i].id, positionOrder[i-1]);
+    }
     const attackBoosts = new Map();
     const targetPenalties = new Map();
+    const cornerEntries = [];
     for (let i=0; i<positionOrder.length-1; i++) {
       const ahead = positionOrder[i];
       const behind = positionOrder[i+1];
@@ -933,6 +987,14 @@
         }
       }
     }
+    const timeCache = new Map();
+    const getTimeFor = (driver) => {
+      if (!driver) return simTime;
+      if (!timeCache.has(driver.id)) {
+        timeCache.set(driver.id, currentElapsedTime(driver, timeAfterStep));
+      }
+      return timeCache.get(driver.id);
+    };
     for (const d of drivers) {
       if (d.finished) continue;
       if (d.inPit) {
@@ -951,15 +1013,43 @@
       }
       const prevLapCount = d.lap ?? 0;
       const lapPos = d.finished ? TRACK_LENGTH_M - 1e-3 : ((d.pos % TRACK_LENGTH_M) + TRACK_LENGTH_M) % TRACK_LENGTH_M;
+      const prevSegType = d.segmentType || 'straight';
       const seg = currentSegment(lapPos);
       let targetV = idealSpeed(d, seg);
+      let drsActive = false;
+      if (seg.drs) {
+        const aheadDriver = aheadMap.get(d.id);
+        if (aheadDriver && !aheadDriver.isDNF) {
+          const gapTime = Math.max(0, getTimeFor(d) - getTimeFor(aheadDriver));
+          if (gapTime <= 1) drsActive = true;
+        }
+      }
+      if (drsActive) {
+        targetV *= 1.10;
+      }
+      if (seg.type !== 'straight') {
+        targetV *= cornerProfileMultiplier(seg, lapPos, d);
+      }
+      if (d.overtakeBoostTimer > 0 && d.overtakeBoostTop > 0) {
+        targetV *= 1 + Math.min(0.2, d.overtakeBoostTop);
+      }
+      if (d.overtakeTimer > 0 && d.overtakePenalty > 0) {
+        targetV *= Math.max(0.5, 1 - d.overtakePenalty);
+      }
       const boost = attackBoosts.get(d.id);
       if (boost) targetV *= (1 + boost);
       const penalty = targetPenalties.get(d.id);
       if (penalty) targetV *= Math.max(0.6, 1 - penalty);
       const car = d.carStats;
       const pilot = d.driverStats;
-      const accelFactor = clamp((car.accel ?? 1) * (pilot.accel ?? 1), 0, 2);
+      let accelFactor = clamp((car.accel ?? 1) * (pilot.accel ?? 1), 0, 2);
+      if (drsActive) {
+        accelFactor *= 1.10;
+      }
+      accelFactor = clamp(accelFactor, 0, 2);
+      if (d.overtakeBoostTimer > 0 && d.overtakeBoostAccel > 0) {
+        accelFactor *= 1 + Math.min(0.3, d.overtakeBoostAccel);
+      }
       const accelRate = 4 + 8 * accelFactor;
       const brakeRate = 4 + 12 * clamp01(pilot.braking ?? 0.5);
       const segIdx = segments.indexOf(seg);
@@ -975,8 +1065,16 @@
           }
         }
       }
-      const delta = targetV - d.v;
-      const change = clamp(delta, -brakeRate*dt, accelRate*dt);
+      let desiredDelta = targetV - d.v;
+      if (desiredDelta > 0 && targetV > 0) {
+        const speedNorm = clamp(d.v / targetV, 0, 0.999);
+        const curveBase = -0.5;
+        const skillBias = (accelFactor - 1) * 0.1;
+        const curve = clamp(curveBase - skillBias, -0.95, 0.95);
+        const reduction = 1 - sCurve(speedNorm, curve);
+        desiredDelta = desiredDelta * clamp(reduction, 0, 1);
+      }
+      const change = clamp(desiredDelta, -brakeRate*dt, accelRate*dt);
       d.v += change;
       const distanceTravelled = Math.max(0, d.v) * dt;
       const tyre = d.carStats;
@@ -1012,6 +1110,26 @@
           startPitStop(d);
         }
       }
+      if (d.overtakeTimer > 0) {
+        d.overtakeTimer = Math.max(0, d.overtakeTimer - stepTime);
+        if (d.overtakeTimer === 0) d.overtakePenalty = 0;
+      }
+      if (d.overtakeBoostTimer > 0) {
+        d.overtakeBoostTimer = Math.max(0, d.overtakeBoostTimer - stepTime);
+        if (d.overtakeBoostTimer === 0) {
+          d.overtakeBoostAccel = 0;
+          d.overtakeBoostTop = 0;
+        }
+      }
+      const newLapPos = d.finished ? TRACK_LENGTH_M - 1e-3 : ((d.pos % TRACK_LENGTH_M) + TRACK_LENGTH_M) % TRACK_LENGTH_M;
+      const segAfter = currentSegment(newLapPos);
+      const segTypeAfter = segAfter.type;
+      const isBattleSegment = segTypeAfter === 'corner' || segTypeAfter === 'chicane' || segTypeAfter === 'straight';
+      if (segTypeAfter !== prevSegType && isBattleSegment) {
+        cornerEntries.push({ driverId: d.id, segType: segTypeAfter, difficulty: segAfter.difficulty ?? 1 });
+        intervalUpdates.add(d.id);
+      }
+      d.segmentType = segTypeAfter;
       if (d.pos >= TOTAL_LENGTH_M) {
         d.pos = TOTAL_LENGTH_M;
         d.finished = true;
@@ -1020,6 +1138,103 @@
       }
       d.lap = d.finished ? LAPS : currentLapCount;
       if (!d.finished) allDone = false;
+    }
+    const ordered = [...drivers].sort((a,b)=>b.pos - a.pos || (a.finishTime??Infinity) - (b.finishTime??Infinity));
+    const lead = ordered[0];
+    if (intervalUpdates.size) {
+      const approxLapTimeBase = fastestLapTime !== Infinity ? fastestLapTime : null;
+      for (let i = 0; i < ordered.length; i++) {
+        const d = ordered[i];
+        const followerFlagged = i + 1 < ordered.length && intervalUpdates.has(ordered[i + 1].id);
+        if (!intervalUpdates.has(d.id) && !followerFlagged) continue;
+        if (d.isDNF) {
+          d.intervalDisplay = '<span style="color:#bd93f9;font-weight:600">DNF</span>';
+          continue;
+        }
+        if (i === 0) {
+          d.intervalDisplay = '+0.0 s';
+          continue;
+        }
+        const ahead = ordered[i - 1];
+        const driverTimeNow = currentElapsedTime(d, simTime);
+        const targetTime = currentElapsedTime(ahead, simTime);
+        let gapSec = Math.max(0, driverTimeNow - targetTime);
+        const approxLapTime = approxLapTimeBase;
+        const completedDiff = Math.max(0, (ahead.lapTimes?.length ?? 0) - (d.lapTimes?.length ?? 0));
+        const distanceGapM = Math.max(0, ahead.pos - d.pos);
+        if (gapSec < 0.05 && distanceGapM > 0.1) {
+          const avgSpeedRaw = ((ahead.v ?? 0) + (d.v ?? 0)) * 0.5;
+          if (avgSpeedRaw > 1) {
+            const avgSpeed = Math.max(1, avgSpeedRaw);
+            gapSec = distanceGapM / avgSpeed;
+          }
+        }
+        let display = formatInterval(gapSec, true, false);
+        if (approxLapTime && gapSec >= approxLapTime) {
+          const lapsBehindByTime = Math.max(1, Math.round(gapSec / approxLapTime));
+          const lapsBehind = Math.max(lapsBehindByTime, completedDiff);
+          display = `${display} (+${lapsBehind} lap${lapsBehind>1?'s':''})`;
+        } else if (!approxLapTime && completedDiff > 0) {
+          const lapsBehind = completedDiff;
+          display = `${display} (+${lapsBehind} lap${lapsBehind>1?'s':''})`;
+        }
+        d.intervalDisplay = display;
+      }
+    }
+    if (cornerEntries.length) {
+      for (const entry of cornerEntries) {
+        const idx = ordered.findIndex(d=>d.id === entry.driverId);
+        if (idx <= 0) continue;
+        const attacker = ordered[idx];
+        const defender = ordered[idx-1];
+        if (!attacker || !defender) continue;
+        const gap = defender.pos - attacker.pos;
+        if (gap > OVERTAKE_GAP_THRESHOLD) continue;
+        attacker.overtakeTotal = (attacker.overtakeTotal ?? 0) + 1;
+        const segmentType = entry.segType;
+        const defenceSkill = clamp01(defender.driverStats?.defense ?? 0.5);
+        let attackSkill = clamp01(attacker.driverStats?.racecraft ?? 0.5);
+        const difficulty = entry.difficulty ?? 1;
+        attackSkill = clamp01(attackSkill * difficulty);
+        const attackRoll = Math.random();
+        const defenceRoll = Math.random();
+        const attackOutcome = attackSkill * attackRoll;
+        const defenceOutcome = defenceSkill * defenceRoll;
+        const attackCritical = attackOutcome < 0.001;
+        const defenceCritical = defenceOutcome < 0.001;
+        if (attackCritical && !defenceCritical) {
+          attacker.overtakeFail = (attacker.overtakeFail ?? 0) + 1;
+          attacker.overtakeTotal = (attacker.overtakeTotal ?? 0) + 1;
+          setDNF(attacker, timeAfterStep);
+          continue;
+        }
+        if (defenceCritical && !attackCritical) {
+          attacker.overtakeSuccess = (attacker.overtakeSuccess ?? 0) + 1;
+          attacker.overtakeTotal = (attacker.overtakeTotal ?? 0) + 1;
+          setDNF(defender, timeAfterStep);
+          continue;
+        }
+        if (attackSkill + 0.05 >= defenceSkill) {
+          attacker.overtakeSuccess = (attacker.overtakeSuccess ?? 0) + 1;
+          const successFactor = clamp01(1 - defenceOutcome);
+          const accelBoost = Math.min(0.02, 0.01 + successFactor * 0.02);
+          const topBoost = Math.min(0.02, 0.005 + successFactor * 0.015);
+          const successEffect = {
+            strength: 0.10,
+            duration: 6
+          };
+          applyOvertakePenalty(defender, successEffect);
+          applyOvertakeBoost(attacker, accelBoost, topBoost, 1.5);
+        } else {
+          attacker.overtakeFail = (attacker.overtakeFail ?? 0) + 1;
+          const failFactor = clamp01(1 - attackOutcome);
+          const failEffect = {
+            strength: clamp(OVERTAKE_FAIL_PENALTY.strength * (0.5 + failFactor * 0.5), 0.05, 0.3),
+            duration: OVERTAKE_FAIL_PENALTY.duration
+          };
+          applyOvertakePenalty(attacker, failEffect);
+        }
+      }
     }
     if (allDone) {
       finished = true;
@@ -1038,37 +1253,17 @@
   }
 
   function renderTable() {
+    const selection = window.getSelection && window.getSelection();
+    if (selection && selection.rangeCount > 0) {
+      const range = selection.getRangeAt(0);
+      if (range && tbl.contains(range.commonAncestorContainer) && selection.type === 'Range') {
+        return;
+      }
+    }
     const order = [...drivers].sort((a,b)=>b.pos - a.pos || (a.finishTime??Infinity) - (b.finishTime??Infinity));
-    const lead = order[0];
-    const leadTimeNow = currentElapsedTime(lead, simTime);
     const focusId = cameraState.targetId ?? (drivers[0]?.id ?? 0);
     tbl.innerHTML = order.map((d,idx)=>{
-      let gap = '—';
-      const driverTimeNow = currentElapsedTime(d, simTime);
-      const gapSecRaw = Math.max(0, driverTimeNow - leadTimeNow);
-      const approxLapTime = fastestLapTime !== Infinity ? fastestLapTime : null;
-      const completedDiff = Math.max(0, (lead.lapTimes?.length ?? 0) - (d.lapTimes?.length ?? 0));
-      const distanceGapM = Math.max(0, lead.pos - d.pos);
-      let gapSec = gapSecRaw;
-      if (gapSec < 0.05 && distanceGapM > 0.1) {
-        const avgSpeedRaw = ((lead.v ?? 0) + (d.v ?? 0)) * 0.5;
-        if (avgSpeedRaw > 1) {
-          const avgSpeed = Math.max(1, avgSpeedRaw);
-          gapSec = distanceGapM / avgSpeed;
-        }
-      }
-      if (idx !== 0) {
-        if (approxLapTime && gapSec >= approxLapTime) {
-          const lapsBehindByTime = Math.max(1, Math.round(gapSec / approxLapTime));
-          const lapsBehind = Math.max(lapsBehindByTime, completedDiff);
-          gap = `${formatInterval(gapSec, false, false)} (+${lapsBehind} lap${lapsBehind>1?'s':''})`;
-        } else if (!approxLapTime && completedDiff > 0) {
-          const lapsBehind = completedDiff;
-          gap = `${formatInterval(gapSec, false, false)} (+${lapsBehind} lap${lapsBehind>1?'s':''})`;
-        } else {
-          gap = formatInterval(gapSec, true, false);
-        }
-      }
+      const gap = d.intervalDisplay ?? (idx === 0 ? '+0.0 s' : '—');
       const spd = d.v * 3.6;
       const spdDisplay = Math.round(spd);
       const maxPossible = Math.max(1, (d.carStats?.topSpeed ?? 360) * (d.driverStats?.topSpeed ?? 1));
@@ -1100,12 +1295,24 @@
         const colorMap = { hard:'#ffffff', medium:'#f9d748', soft:'#ff4d4d' };
         const letter = labelMap[compoundKey] || 'H';
         const ringColor = colorMap[compoundKey] || '#ffffff';
-        tyreCell = `<span class="tyre-badge"><span class="tyre-ring" style="color:${ringColor}">${letter}</span><span>${tyrePct}%</span></span>`;
+      tyreCell = `<span class="tyre-badge"><span class="tyre-ring" style="color:${ringColor}">${letter}</span><span>${tyrePct}%</span></span>`;
       }
       const lapSummary = formatLapSummary(d);
       const speedBar = `<div class="speed-bar" style="--pct:${pct}%"><span>${spdDisplay}</span></div>`;
+      const successCount = Math.max(0, d.overtakeSuccess ?? 0);
+      const failCount = Math.max(0, d.overtakeFail ?? 0);
+      const totalCount = Math.max(0, d.overtakeTotal ?? (successCount + failCount));
+      const engagementCell = `<span class="total">${totalCount}</span><span class="sep">/</span><span class="success">${successCount}</span><span class="sep">/</span><span class="fail">${failCount}</span>`;
       const rowClass = isFocus ? ' class="focus"' : '';
-      return `<tr data-driver="${d.id}"${rowClass}><td>${idx+1}</td><td>${flag}${name}${teamLine}</td><td>${gap}</td><td class="tyre-cell">${tyreCell}</td><td class="speed-cell">${speedBar}</td><td>${lapSummary}</td></tr>`;
+      const startSlot = Number.isFinite(d.startSlot) ? d.startSlot : idx;
+      const change = startSlot - idx;
+      let positionDisplay = `${idx+1}`;
+      if (change > 0) {
+        positionDisplay += ` <span class="pos-change up">↑${change}</span>`;
+      } else if (change < 0) {
+        positionDisplay += ` <span class="pos-change down">↓${Math.abs(change)}</span>`;
+      }
+      return `<tr data-driver="${d.id}"${rowClass}><td>${positionDisplay}</td><td>${flag}${name}${teamLine}</td><td class="interval-cell">${gap}</td><td class="tyre-cell">${tyreCell}</td><td class="overtake-cell"><span class="engagement-stats">${engagementCell}</span></td><td class="speed-cell">${speedBar}</td><td class="lap-cell">${lapSummary}</td></tr>`;
     }).join('');
   }
 
@@ -1167,7 +1374,19 @@
       d.lastPitService = null;
       d.pitJustExited = false;
       d.v = 0;
+      d.overtakePenalty = 0;
+      d.overtakeTimer = 0;
+      d.overtakeTotal = 0;
+      d.overtakeSuccess = 0;
+      d.overtakeFail = 0;
+      d.segmentType = segments[0]?.type || 'straight';
+      d.isDNF = false;
+      d.overtakeBoostAccel = 0;
+      d.overtakeBoostTop = 0;
+      d.overtakeBoostTimer = 0;
+      d.intervalDisplay = '—';
     });
+    if (drivers.length) drivers[0].intervalDisplay = '+0.0 s';
     updateControls();
     updateStatus();
   }
@@ -1208,6 +1427,7 @@
     updateSegmentInfoForPlayer();
     updateControls();
     updateStatus();
+    if (drivers.length) drivers[0].intervalDisplay = '+0.0 s';
   }
 
   function updateControls() {
@@ -1218,13 +1438,77 @@
   }
 
   // ---- helpers ----
-  function clamp(x,min=0,max=1){ return Math.max(min, Math.min(max, x)); }
-  function lerp(a,b,t){ return a + (b - a) * t; }
-  function clamp01(x){ return clamp(x,0,1); }
-  function getCSS(varName){ return getComputedStyle(document.documentElement).getPropertyValue(varName).trim(); }
+  function applyOvertakePenalty(driver, effect) {
+    if (!driver || !effect) return;
+    const strength = clamp(effect.strength ?? 0, 0, 0.9);
+    const duration = Math.max(0, effect.duration ?? 0);
+    if (strength <= 0 || duration <= 0) return;
+    driver.overtakePenalty = Math.max(driver.overtakePenalty ?? 0, strength);
+    driver.overtakeTimer = Math.max(driver.overtakeTimer ?? 0, duration);
+  }
+  function applyOvertakeBoost(driver, accelBoost, topBoost, duration) {
+    if (!driver || duration <= 0) return;
+    driver.overtakeBoostAccel = Math.max(driver.overtakeBoostAccel ?? 0, accelBoost ?? 0);
+    driver.overtakeBoostTop = Math.max(driver.overtakeBoostTop ?? 0, topBoost ?? 0);
+    driver.overtakeBoostTimer = Math.max(driver.overtakeBoostTimer ?? 0, duration);
+  }
+  function setDNF(driver, finishTime) {
+    if (!driver || driver.finished) return;
+    driver.finished = true;
+    driver.finishTime = finishTime;
+    driver.v = 0;
+    driver.isDNF = true;
+    driver.intervalDisplay = '<span style="color:#bd93f9;font-weight:600">DNF</span>';
+  }
+  function applyTeamModifiers(car, team) {
+    const mod = teamCarModifiers[team];
+    if (!mod) return;
+    if (mod.top) {
+      car.topSpeed = clamp(car.topSpeed * mod.top, 320, 370);
+    }
+    if (mod.accel) {
+      car.baseAccel = clamp01(car.baseAccel * mod.accel);
+      car.accel = clamp01(car.accel * mod.accel);
+    }
+    if (mod.handling) {
+      car.baseHandling = clamp01(car.baseHandling * mod.handling);
+      car.handling = clamp01(car.handling * mod.handling);
+    }
+  }
+function clamp(x,min=0,max=1){ return Math.max(min, Math.min(max, x)); }
+function lerp(a,b,t){ return a + (b - a) * t; }
+function clamp01(x){ return clamp(x,0,1); }
+function getCSS(varName){ return getComputedStyle(document.documentElement).getPropertyValue(varName).trim(); }
+function sCurve(v, curve) {
+  const curveClamped = clamp(curve, -0.999, 0.999);
+  const cvi = curveClamped * v;
+  const v1 = v - cvi;
+  const v2 = curveClamped - 2 * curveClamped * Math.abs(v) + 1;
+  const vo = v2 !== 0 ? v1 / v2 : v;
+  return clamp(vo, 0, 1);
+}
+function cornerProfileMultiplier(seg, lapPos, driver) {
+  const length = Math.max(1, (seg.end - seg.start));
+  const offset = ((lapPos - seg.start) + length) % length;
+  const progress = clamp(offset / length, 0, 1);
+  const apexPoint = seg.type === 'chicane' ? 0.35 : 0.5;
+  const handling = clamp01((driver.carStats?.handling ?? 1) * (driver.driverStats?.handling ?? 1));
+  const minFactor = clamp(0.4 + handling * 0.3, 0.4, 0.75);
+  const exitFactor = 1 + 0.02 * handling;
+  let factor;
+  if (progress <= apexPoint) {
+    const t = apexPoint > 0 ? progress / apexPoint : 1;
+    factor = lerp(1, minFactor, t);
+  } else {
+    const denom = (1 - apexPoint) > 0 ? (1 - apexPoint) : 1;
+    const t = (progress - apexPoint) / denom;
+    factor = lerp(minFactor, exitFactor, clamp(t, 0, 1));
+  }
+  return clamp(factor, 0.35, exitFactor);
+ }
 
-  updateControls();
-  updateStatus();
+updateControls();
+updateStatus();
 })();
 </script>
 </body>
