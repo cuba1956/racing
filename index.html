@@ -42,9 +42,12 @@
     .pos-change { font-size:11px; font-weight:600; margin-left:6px; }
     .pos-change.up { color:var(--ok); }
     .pos-change.down { color:var(--bad); }
-    .speed-bar { position:relative; height:20px; border:1px solid #2a3240; border-radius:6px; overflow:hidden; background:#1a2028; }
-    .speed-bar::before { content:''; position:absolute; inset:0; width:var(--pct,0%); background:linear-gradient(90deg, rgba(123,216,143,0.35), rgba(123,216,143,0.75)); }
-    .speed-bar span { position:relative; display:block; text-align:center; line-height:18px; font-size:12px; color:var(--text); }
+    .speed-bar { position:relative; height:20px; border:1px solid #2a3240; border-radius:6px; background:#1a2028; overflow:visible; }
+    .speed-bar .speed-fill { position:absolute; top:0; height:100%; border-radius:6px; pointer-events:none; }
+    .speed-bar .speed-fill.base { left:0; background:linear-gradient(90deg, rgba(123,216,143,0.35), rgba(123,216,143,0.75)); }
+    .speed-bar .speed-fill.boost { background:linear-gradient(90deg, rgba(255,210,0,0.4), rgba(255,210,0,0.85)); }
+    .speed-bar .speed-fill.dirty { background:linear-gradient(90deg, rgba(220,60,60,0.4), rgba(220,60,60,0.85)); }
+    .speed-bar span { position:relative; display:block; text-align:center; line-height:18px; font-size:12px; color:var(--text); z-index:2; }
     .engagement-stats { display:flex; justify-content:center; gap:6px; font-size:12px; }
     .engagement-stats span { display:inline-block; }
     .engagement-stats .success { color:var(--ok); }
@@ -153,9 +156,9 @@
   const OVERTAKE_SUCCESS_PENALTY = { strength: 0.12, duration: 1.2 };
   const OVERTAKE_FAIL_PENALTY = { strength: 0.10, duration: 1.0 };
   const tyreCompounds = {
-    hard:   { wear: 1.0, grip: 1.0, accel: 1.0 },
-    medium: { wear: 1.5, grip: 1.05, accel: 1.05 },
-    soft:   { wear: 2.0, grip: 1.10, accel: 1.10 }
+    hard:   { wear: 1.0, grip: 1.0, accel: 1.0, life: 32 },
+    medium: { wear: 1.5, grip: 1.05, accel: 1.05, life: 22 },
+    soft:   { wear: 2.0, grip: 1.10, accel: 1.10, life: 14 }
   };
   const PIT_LANE_TIME = 25;
   const teamPitStats = {
@@ -172,30 +175,66 @@
   };
   let fastestLapTime = Infinity;
 
-  function chooseCompound(team) {
-    return 'medium';
+  function choosePitCompound(driver, lapsRemaining) {
+    const inventory = driver?.tyreInventory ?? [];
+    const remaining = Math.max(0, Number.isFinite(lapsRemaining) ? lapsRemaining : 0);
+    if (!inventory.length) {
+      return driver?.carStats?.tyreCompound ?? 'hard';
+    }
+    const options = inventory.map(compound => ({
+      compound,
+      life: compoundLifeLaps(compound),
+      speed: compoundSpeedRank(compound)
+    }));
+    const viableSingle = options
+      .filter(opt => opt.life >= remaining)
+      .sort((a, b) => (b.speed - a.speed) || (b.life - a.life));
+    if (viableSingle.length) {
+      return viableSingle[0].compound;
+    }
+    let bestCombo = null;
+    for (let i = 0; i < options.length; i++) {
+      const first = options[i];
+      const remainingAfterFirst = Math.max(0, remaining - first.life);
+      if (remainingAfterFirst <= 0) continue;
+      for (let j = 0; j < options.length; j++) {
+        if (i === j) continue;
+        const second = options[j];
+        if (second.life >= remainingAfterFirst) {
+          const score = first.speed * 100 + second.speed * 10 + first.life;
+          if (!bestCombo || score > bestCombo.score) {
+            bestCombo = { first: first.compound, score };
+          }
+        }
+      }
+    }
+    if (bestCombo) {
+      return bestCombo.first;
+    }
+    options.sort((a, b) => (b.speed - a.speed) || (b.life - a.life));
+    return options[0].compound;
   }
 
   const teamCarModifiers = {
-    'McLaren F1 Team':         { top: 1.015, accel: 1.01, handling: 1.01 },
+    'McLaren F1 Team':         { top: 1.0, accel: 1.01, handling: 1.01 },
     'Oracle Red Bull Racing':  { top: 0.992, accel: 0.99, handling: 0.995 }
   };
 
   // Track segments: start/end in metres
   const segments = [
-    seg('straight', 0, 600),
+    seg('straight', 0, 600, 1.0, 1.05, true, 'main'),
     seg('corner',   600, 900, 0.58, 0.90),
     seg('straight', 900, 1500),
     seg('chicane',  1500, 1650, 0.52, 0.85),
-    seg('straight', 1650, 2100, 1.0, 1.05, true),
+    seg('straight', 1650, 2100, 1.0, 1.05),
     seg('corner',   2100, 2500, 0.62, 0.90),
-    seg('straight', 2500, 3200),
+    seg('straight', 2500, 3200, 1.0, 1.05, true, 'back'),
     seg('corner',   3200, 3600, 0.57, 0.88),
     seg('corner',   3600, 3875, 0.55, 0.87),
     seg('corner',   3875, 4150, 0.58, 0.89),
-    seg('straight', 4150, TRACK_LENGTH_M, 1.0, 1.05, true)
+    seg('straight', 4150, TRACK_LENGTH_M, 1.0, 1.05, true, 'main')
   ];
-  function seg(type, start, end, grip, overtakeDifficulty, drsZone=false) {
+  function seg(type, start, end, grip, overtakeDifficulty, drsZone=false, drsId=null) {
     const baseGrip = (type === 'straight') ? 1.0 : (grip ?? 0.6);
     let difficulty = overtakeDifficulty;
     if (difficulty == null) {
@@ -203,7 +242,7 @@
       else if (type === 'chicane') difficulty = 0.85;
       else difficulty = 1;
     }
-    return { type, start, end, grip: baseGrip, overtake: type === 'straight', difficulty, drs: !!drsZone };
+    return { type, start, end, grip: baseGrip, overtake: type === 'straight', difficulty, drs: !!drsZone, drsId: drsZone ? (drsId ?? `${start}-${end}`) : null };
   }
   // ---- DRIVER MODEL ----
   const maxPoints = Math.max(...driverSeed.map(d => d.points));
@@ -231,8 +270,9 @@
     const driverBrakingFactor = perfFactor(lerp(form, cornerFocus, 0.6));
     const driverTyreFactor = lerp(0.9, 1, Math.random());
     const teamPit = teamPitStats[data.team] || { baseTime: 3.8, agility: 0.85, luck: 0.2, lane: PIT_LANE_TIME };
-    const compoundKey = chooseCompound(data.team);
-    const compound = tyreCompounds[compoundKey] || tyreCompounds.hard;
+    const tyreInventory = createTyreInventory();
+    const initialCompoundKey = drawTyreSet(tyreInventory) ?? 'medium';
+    const compound = tyreCompounds[initialCompoundKey] || tyreCompounds.hard;
     const baseAccel = clamp01(carAccelFactor);
     const baseHandling = clamp01(carHandlingFactor);
     const baseWear = clamp01(lerp(0.2, 0.4, 1 - carHandlingFactor));
@@ -245,11 +285,11 @@
       handling: baseHandling,
       tyreCondition: 1,
       tyreDegradation: baseWear * (compound.wear ?? 1),
-      tyreCompound: compoundKey,
+      tyreCompound: initialCompoundKey,
       tyreGripMult: compound.grip ?? 1,
       tyreWearMult: compound.wear ?? 1
     };
-    applyCompoundToCar(carStats, compoundKey);
+    applyCompoundToCar(carStats, initialCompoundKey);
     applyTeamModifiers(carStats, data.team);
     const defenceFocus = clamp(balanceSkill(data.defence ?? data.defense ?? racecraft), 0, 1);
     const driverRacecraft = clamp01(lerp(racecraft, form, 0.3));
@@ -294,6 +334,9 @@
       pitTimer: 0,
       pitStats: teamPit,
       pitLapDisplay: 0,
+      pitTargetCompound: null,
+      tyreInventory,
+      tyreHistory: [initialCompoundKey],
       lastPitService: null,
       overtakePenalty: 0,
       overtakeTimer: 0,
@@ -301,6 +344,12 @@
       overtakeSuccess: 0,
       overtakeFail: 0,
       segmentType: segments[0]?.type || 'straight',
+      segmentIndex: 0,
+      drsActiveSegment: null,
+      drsZoneId: null,
+      drsGranted: false,
+      drsEntryGap: null,
+      overtakePenaltySource: null,
       isDNF: false,
       overtakeBoostAccel: 0,
       overtakeBoostTop: 0,
@@ -343,7 +392,11 @@
   canvas.addEventListener('pointermove', handleSegmentPointer);
   canvas.addEventListener('pointerleave', handleSegmentLeave);
   tbl.addEventListener('click', (evt) => {
-    const row = evt.target.closest('tr[data-driver]');
+    const baseTarget = evt.target && evt.target.nodeType === Node.ELEMENT_NODE
+      ? evt.target
+      : evt.target?.parentElement;
+    if (!baseTarget) return;
+    const row = baseTarget.closest('tr[data-driver]');
     if (!row) return;
     const id = Number(row.dataset.driver);
     if (!Number.isFinite(id)) return;
@@ -378,31 +431,98 @@
     targetId: 0,
   };
 
+  function shuffleArray(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  function compoundSpeedRank(key) {
+    switch (key) {
+      case 'soft': return 3;
+      case 'medium': return 2;
+      case 'hard': return 1;
+      default: return 0;
+    }
+  }
+
+  function compoundLifeLaps(key) {
+    return tyreCompounds[key]?.life ?? 18;
+  }
+
+  function createTyreInventory() {
+    const sets = [];
+    let softUsed = false;
+    while (sets.length < 3) {
+      const choices = softUsed ? ['hard', 'medium'] : ['hard', 'medium', 'soft'];
+      const choice = choices[Math.floor(Math.random() * choices.length)];
+      if (choice === 'soft') softUsed = true;
+      sets.push(choice);
+    }
+    return sets;
+  }
+
+  function drawTyreSet(inventory, preferred = null) {
+    if (!inventory || inventory.length === 0) return null;
+    if (preferred) {
+      const idx = inventory.indexOf(preferred);
+      if (idx !== -1) {
+        const [compound] = inventory.splice(idx, 1);
+        return compound;
+      }
+    }
+    const idx = Math.floor(Math.random() * inventory.length);
+    const [compound] = inventory.splice(idx, 1);
+    return compound;
+  }
+
   function applyGridPositions(list) {
     const total = list.length;
-    const slots = Array.from({length: total}, (_,i)=>i);
-    const reserved = new Map();
-    const lastSlot = slots[slots.length - 1];
-    const reserveSlot = (driver, fallbackSlot) => {
-      if (!driver) return;
-      const slot = fallbackSlot ?? slots[slots.length - 1];
-      const index = slots.indexOf(slot);
-      if (index !== -1) slots.splice(index, 1);
-      reserved.set(driver.id, slot);
+    const makeSlots = (start, end) => {
+      const bucket = [];
+      const cappedStart = Math.min(start, total);
+      const cappedEnd = Math.min(end, total);
+      if (cappedStart >= cappedEnd) return bucket;
+      for (let slot = cappedStart; slot < cappedEnd; slot++) bucket.push(slot);
+      return shuffleArray(bucket);
     };
-    const maxDriver = list.find(d => d.code === 'VER');
-    if (maxDriver) {
-      const targetSlot = Math.min(lastSlot, 4);
-      reserveSlot(maxDriver, targetSlot);
+    const groupSlots = [
+      makeSlots(0, 5),
+      makeSlots(5, 10),
+      makeSlots(10, 20)
+    ];
+    const playerIndex = list.findIndex(d => d.isPlayer);
+    const player = playerIndex >= 0 ? list[playerIndex] : null;
+    const others = player ? list.filter(d => d.id !== player.id) : [...list];
+    const groupDrivers = [[], [], []];
+    const group0Count = Math.min(5, others.length);
+    const group1Count = Math.min(5, Math.max(0, others.length - group0Count));
+    groupDrivers[0] = others.slice(0, group0Count);
+    groupDrivers[1] = others.slice(group0Count, group0Count + group1Count);
+    groupDrivers[2] = others.slice(group0Count + group1Count);
+    if (player) groupDrivers[2].push(player);
+    const slotFor = new Map();
+    groupDrivers.forEach((driversInGroup, groupIndex) => {
+      const slots = groupSlots[groupIndex] ?? [];
+      for (const drv of driversInGroup) {
+        const slot = slots.length ? slots.shift() : null;
+        if (slot != null) slotFor.set(drv.id, slot);
+      }
+    });
+    const remainingSlots = [];
+    const usedSlots = new Set(slotFor.values());
+    for (let slot = 0; slot < total; slot++) {
+      if (!usedSlots.has(slot)) remainingSlots.push(slot);
     }
-    const playerDriver = list.find(d => d.isPlayer && (!maxDriver || d.id !== maxDriver.id));
-    if (playerDriver) {
-      const fallback = slots.length ? slots[slots.length - 1] : lastSlot - 1;
-      reserveSlot(playerDriver, fallback);
-    }
-    for (let i=0;i<total;i++) {
+    const lastSlot = total > 0 ? total - 1 : 0;
+    for (let i = 0; i < total; i++) {
       const d = list[i];
-      const slot = reserved.has(d.id) ? reserved.get(d.id) : (slots.length ? slots.shift() : 0);
+      let slot = slotFor.get(d.id);
+      if (slot == null) {
+        slot = remainingSlots.length ? remainingSlots.shift() : i;
+      }
       const isSoloLastRow = (total % 2 === 1) && slot === lastSlot && slot % 2 === 0;
       const lane = isSoloLastRow ? 0 : (slot % 2 === 0 ? -1 : 1);
       d.startSlot = slot;
@@ -491,7 +611,7 @@
     // segments (tile +/- one lap)
     for (let offset = -1; offset <= 1; offset++) {
       for (const s of segments) {
-        if (s.type === 'straight') continue;
+        if (s.type === 'straight' && !s.drs) continue;
         const startAbs = (playerLapIndex + offset) * TRACK_LENGTH_M + s.start;
         const endAbs = (playerLapIndex + offset) * TRACK_LENGTH_M + s.end;
         let y1 = absPosToScreenY(startAbs);
@@ -501,13 +621,23 @@
         if (clampedStart === clampedEnd) continue;
         const segTop = Math.min(clampedStart, clampedEnd);
         const segHeight = Math.abs(clampedEnd - clampedStart);
-        ctx.fillStyle = segColor(s.type, 0.35);
-        ctx.fillRect(trackX - trackHalf, segTop, trackWidth, segHeight);
-        ctx.fillStyle = segColor(s.type, 1);
-        ctx.font = `bold ${12 * dpr}px system-ui`;
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(segLabel(s), trackX, segTop + segHeight * 0.5);
+        if (s.drs && s.type === 'straight') {
+          ctx.fillStyle = 'rgba(105, 196, 255, 0.05)';
+          ctx.fillRect(trackX - trackHalf, segTop, trackWidth, segHeight);
+          ctx.fillStyle = '#69c4ff';
+          ctx.font = `bold ${12 * dpr}px system-ui`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('DRS', trackX, segTop + segHeight * 0.5);
+        } else {
+          ctx.fillStyle = segColor(s.type, 0.35);
+          ctx.fillRect(trackX - trackHalf, segTop, trackWidth, segHeight);
+          ctx.fillStyle = segColor(s.type, 1);
+          ctx.font = `bold ${12 * dpr}px system-ui`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(segLabel(s), trackX, segTop + segHeight * 0.5);
+        }
       }
     }
 
@@ -837,7 +967,7 @@
     car.tyreDegradation = baseWear * (compound.wear ?? 1);
   }
 
-  function startPitStop(driver) {
+  function startPitStop(driver, lapsRemaining = null) {
     const pit = driver.pitStats || { baseTime:4, agility:0.85, luck:0.2, lane: PIT_LANE_TIME };
     let pitService = Math.max(0.5, pit.baseTime * pit.agility);
     if (Math.random() < (pit.luck ?? 0.2)) pitService = Math.max(0.5, pitService - 1.5);
@@ -848,6 +978,10 @@
     driver.pitLapDisplay = 1;
     driver.pitJustExited = true;
     driver.v = 0;
+    const targetCompound = choosePitCompound(driver, lapsRemaining);
+    if (targetCompound) {
+      driver.pitTargetCompound = targetCompound;
+    }
   }
 
   function setSegmentDisplay(seg, index, source, opts = {}) {
@@ -955,8 +1089,16 @@
     for (let i=1; i<positionOrder.length; i++) {
       aheadMap.set(positionOrder[i].id, positionOrder[i-1]);
     }
+    for (const d of drivers) {
+      d.uiSpeedBoost = 0;
+      d.uiSpeedPenalty = 0;
+      d.uiSpeedBoostSources = [];
+      d.uiSpeedPenaltySources = [];
+    }
     const attackBoosts = new Map();
     const targetPenalties = new Map();
+    const boostSources = new Map();
+    const penaltySources = new Map();
     const cornerEntries = [];
     for (let i=0; i<positionOrder.length-1; i++) {
       const ahead = positionOrder[i];
@@ -974,16 +1116,31 @@
       if (diff >= 0) {
         const boost = diff * slip * 0.25;
         if (boost > 0) {
-          attackBoosts.set(behind.id, Math.max(attackBoosts.get(behind.id) ?? 0, boost));
+          const prev = attackBoosts.get(behind.id) ?? 0;
+          const next = Math.max(prev, boost);
+          attackBoosts.set(behind.id, next);
+          const tags = boostSources.get(behind.id) ?? [];
+          if (!tags.includes('slipstream')) tags.push('slipstream');
+          boostSources.set(behind.id, tags);
         }
         const aheadDrag = diff * slip * 0.05;
         if (aheadDrag > 0) {
-          targetPenalties.set(ahead.id, Math.max(targetPenalties.get(ahead.id) ?? 0, aheadDrag));
+          const prev = targetPenalties.get(ahead.id) ?? 0;
+          const next = Math.max(prev, aheadDrag);
+          targetPenalties.set(ahead.id, next);
+          const tags = penaltySources.get(ahead.id) ?? [];
+          if (!tags.includes('encounter-drag')) tags.push('encounter-drag');
+          penaltySources.set(ahead.id, tags);
         }
       } else {
         const block = (-diff) * slip * 0.2;
         if (block > 0) {
-          targetPenalties.set(behind.id, Math.max(targetPenalties.get(behind.id) ?? 0, block));
+          const prev = targetPenalties.get(behind.id) ?? 0;
+          const next = Math.max(prev, block);
+          targetPenalties.set(behind.id, next);
+          const tags = penaltySources.get(behind.id) ?? [];
+          if (!tags.includes('encounter-fail')) tags.push('encounter-fail');
+          penaltySources.set(behind.id, tags);
         }
       }
     }
@@ -999,13 +1156,32 @@
       if (d.finished) continue;
       if (d.inPit) {
         d.v = 0;
+        d.drsActiveSegment = null;
+        d.drsZoneId = null;
+        d.drsGranted = false;
+        d.drsEntryGap = null;
         d.pitTimer -= stepTime;
         if (d.pitTimer <= 0) {
           d.inPit = false;
           d.pitTimer = 0;
-          if (d.carStats) d.carStats.tyreCondition = 1;
+          if (d.carStats) {
+            let selectedCompound = null;
+            if (Array.isArray(d.tyreInventory) && d.tyreInventory.length > 0) {
+              selectedCompound = drawTyreSet(d.tyreInventory, d.pitTargetCompound);
+            }
+            const targetCompound = selectedCompound ?? d.pitTargetCompound ?? d.carStats.tyreCompound ?? 'hard';
+            applyCompoundToCar(d.carStats, targetCompound);
+            d.carStats.tyreCondition = 1;
+            if (!Array.isArray(d.tyreHistory)) d.tyreHistory = [];
+            d.tyreHistory.push(targetCompound);
+          }
+          d.pitTargetCompound = null;
           d.pitLapDisplay = 1;
           d.pitJustExited = true;
+          d.drsActiveSegment = null;
+          d.drsZoneId = null;
+          d.drsGranted = false;
+          d.drsEntryGap = null;
         } else {
           allDone = false;
           continue;
@@ -1015,17 +1191,71 @@
       const lapPos = d.finished ? TRACK_LENGTH_M - 1e-3 : ((d.pos % TRACK_LENGTH_M) + TRACK_LENGTH_M) % TRACK_LENGTH_M;
       const prevSegType = d.segmentType || 'straight';
       const seg = currentSegment(lapPos);
+      const segIdx = segments.indexOf(seg);
+      const zoneId = seg.drs ? (seg.drsId ?? segIdx) : null;
       let targetV = idealSpeed(d, seg);
-      let drsActive = false;
+      const aheadDriver = aheadMap.get(d.id);
+      const enteringSegment = d.segmentIndex !== segIdx;
+      if (enteringSegment) {
+        d.segmentIndex = segIdx;
+        intervalUpdates.add(d.id);
+      }
       if (seg.drs) {
-        const aheadDriver = aheadMap.get(d.id);
+        const enteringZone = d.drsZoneId !== zoneId;
+        if (enteringZone) {
+          let eligible = false;
+          if (aheadDriver && !aheadDriver.isDNF) {
+            const aheadLap = Math.floor(aheadDriver.pos / TRACK_LENGTH_M);
+            const driverLap = Math.floor(d.pos / TRACK_LENGTH_M);
+            const gapDist = aheadDriver.pos - d.pos;
+            const closeOnWrap = aheadLap === driverLap + 1 && gapDist <= 180;
+            const sameLap = aheadLap === driverLap;
+            if (sameLap || closeOnWrap) {
+              const gapTimeEntry = Math.max(0, (getTimeFor(d) ?? 0) - (getTimeFor(aheadDriver) ?? 0));
+              if (gapTimeEntry <= 1 && gapDist <= 180) {
+                eligible = true;
+                d.drsEntryGap = gapTimeEntry;
+              }
+            }
+          }
+          d.drsZoneId = zoneId;
+          if (eligible) {
+            d.drsGranted = true;
+            d.drsActiveSegment = segIdx;
+            if (aheadDriver) intervalUpdates.add(aheadDriver.id);
+          } else {
+            d.drsGranted = false;
+            d.drsActiveSegment = null;
+            d.drsEntryGap = null;
+          }
+        } else if (d.drsGranted && d.drsZoneId === zoneId) {
+          d.drsActiveSegment = segIdx;
+        }
+      } else {
+        if (d.drsZoneId !== null || d.drsGranted) intervalUpdates.add(d.id);
+        d.drsZoneId = null;
+        d.drsGranted = false;
+        d.drsActiveSegment = null;
+        d.drsEntryGap = null;
+      }
+      const drsActive = seg.drs && d.drsGranted && d.drsZoneId === zoneId;
+      let dirtyAir = false;
+      if (!seg.drs && seg.type !== 'straight') {
         if (aheadDriver && !aheadDriver.isDNF) {
           const gapTime = Math.max(0, getTimeFor(d) - getTimeFor(aheadDriver));
-          if (gapTime <= 1) drsActive = true;
+          if (gapTime <= 1 && (aheadDriver.pos - d.pos) < 150) dirtyAir = true;
         }
       }
       if (drsActive) {
         targetV *= 1.10;
+        d.uiSpeedBoost = Math.max(d.uiSpeedBoost ?? 0, 0.10);
+        if (!d.uiSpeedBoostSources.includes('drs')) d.uiSpeedBoostSources.push('drs');
+      }
+      if (dirtyAir) {
+        targetV *= 0.95;
+        const applied = 0.05;
+        d.uiSpeedPenalty = Math.max(d.uiSpeedPenalty ?? 0, applied);
+        if (!d.uiSpeedPenaltySources.includes('dirty-air')) d.uiSpeedPenaltySources.push('dirty-air');
       }
       if (seg.type !== 'straight') {
         targetV *= cornerProfileMultiplier(seg, lapPos, d);
@@ -1034,17 +1264,48 @@
         targetV *= 1 + Math.min(0.2, d.overtakeBoostTop);
       }
       if (d.overtakeTimer > 0 && d.overtakePenalty > 0) {
-        targetV *= Math.max(0.5, 1 - d.overtakePenalty);
+        const penaltyMult = Math.max(0.5, 1 - d.overtakePenalty);
+        targetV *= penaltyMult;
+        if (d.overtakePenaltySource === 'fail') {
+          const applied = 1 - penaltyMult;
+          if (applied > 0) {
+            d.uiSpeedPenalty = Math.max(d.uiSpeedPenalty ?? 0, applied);
+            if (!d.uiSpeedPenaltySources.includes('unsuccessful')) d.uiSpeedPenaltySources.push('unsuccessful');
+          }
+        }
       }
       const boost = attackBoosts.get(d.id);
-      if (boost) targetV *= (1 + boost);
+      if (boost) {
+        targetV *= (1 + boost);
+        d.uiSpeedBoost = Math.max(d.uiSpeedBoost ?? 0, boost);
+        const tags = boostSources.get(d.id);
+        if (tags) {
+          for (const tag of tags) {
+            if (!d.uiSpeedBoostSources.includes(tag)) d.uiSpeedBoostSources.push(tag);
+          }
+        }
+      }
       const penalty = targetPenalties.get(d.id);
-      if (penalty) targetV *= Math.max(0.6, 1 - penalty);
+      if (penalty) {
+        const penaltyMult = Math.max(0.6, 1 - penalty);
+        targetV *= penaltyMult;
+        const tags = penaltySources.get(d.id) ?? [];
+        if (tags.includes('encounter-fail')) {
+          const applied = 1 - penaltyMult;
+          if (applied > 0) {
+            d.uiSpeedPenalty = Math.max(d.uiSpeedPenalty ?? 0, applied);
+            if (!d.uiSpeedPenaltySources.includes('unsuccessful')) d.uiSpeedPenaltySources.push('unsuccessful');
+          }
+        }
+      }
       const car = d.carStats;
       const pilot = d.driverStats;
       let accelFactor = clamp((car.accel ?? 1) * (pilot.accel ?? 1), 0, 2);
       if (drsActive) {
         accelFactor *= 1.10;
+      }
+      if (dirtyAir) {
+        accelFactor *= 0.95;
       }
       accelFactor = clamp(accelFactor, 0, 2);
       if (d.overtakeBoostTimer > 0 && d.overtakeBoostAccel > 0) {
@@ -1052,7 +1313,6 @@
       }
       const accelRate = 4 + 8 * accelFactor;
       const brakeRate = 4 + 12 * clamp01(pilot.braking ?? 0.5);
-      const segIdx = segments.indexOf(seg);
       const nextSeg = segments[(segIdx + 1) % segments.length];
       if (nextSeg && nextSeg !== seg && nextSeg.type !== 'straight') {
         const distToEnd = Math.max(0, (seg.end - lapPos));
@@ -1105,14 +1365,19 @@
           if (d.pitLapDisplay === 0) d.lastPitService = null;
         }
         const tyreCondition = d.carStats?.tyreCondition ?? 1;
-        const lapsRemaining = LAPS - currentLapCount;
+        const travelled = Math.max(0, d.pos);
+        const distanceRemaining = Math.max(0, TOTAL_LENGTH_M - travelled);
+        const lapsRemaining = distanceRemaining / TRACK_LENGTH_M;
         if (!d.inPit && tyreCondition <= 0.3 && !d.finished && lapsRemaining > 2) {
-          startPitStop(d);
+          startPitStop(d, lapsRemaining);
         }
       }
       if (d.overtakeTimer > 0) {
         d.overtakeTimer = Math.max(0, d.overtakeTimer - stepTime);
-        if (d.overtakeTimer === 0) d.overtakePenalty = 0;
+        if (d.overtakeTimer === 0) {
+          d.overtakePenalty = 0;
+          d.overtakePenaltySource = null;
+        }
       }
       if (d.overtakeBoostTimer > 0) {
         d.overtakeBoostTimer = Math.max(0, d.overtakeBoostTimer - stepTime);
@@ -1217,12 +1482,13 @@
         if (attackSkill + 0.05 >= defenceSkill) {
           attacker.overtakeSuccess = (attacker.overtakeSuccess ?? 0) + 1;
           const successFactor = clamp01(1 - defenceOutcome);
-          const accelBoost = Math.min(0.02, 0.01 + successFactor * 0.02);
-          const topBoost = Math.min(0.02, 0.005 + successFactor * 0.015);
+          const accelBoost = Math.min(0.08, 0.04 + successFactor * 0.08);
+          const topBoost = Math.min(0.08, 0.02 + successFactor * 0.06);
           const successEffect = {
-            strength: 0.10,
-            duration: 6
+            strength: 0.20,
+            duration: 12
           };
+          defender.overtakePenaltySource = 'defence';
           applyOvertakePenalty(defender, successEffect);
           applyOvertakeBoost(attacker, accelBoost, topBoost, 1.5);
         } else {
@@ -1232,6 +1498,7 @@
             strength: clamp(OVERTAKE_FAIL_PENALTY.strength * (0.5 + failFactor * 0.5), 0.05, 0.3),
             duration: OVERTAKE_FAIL_PENALTY.duration
           };
+          attacker.overtakePenaltySource = 'fail';
           applyOvertakePenalty(attacker, failEffect);
         }
       }
@@ -1260,14 +1527,27 @@
         return;
       }
     }
-    const order = [...drivers].sort((a,b)=>b.pos - a.pos || (a.finishTime??Infinity) - (b.finishTime??Infinity));
+    const isGridPhase = !started && !finished;
+    const order = [...drivers].sort((a, b) => {
+      if (isGridPhase) {
+        const slotA = Number.isFinite(a.startSlot) ? a.startSlot : Number.MAX_SAFE_INTEGER;
+        const slotB = Number.isFinite(b.startSlot) ? b.startSlot : Number.MAX_SAFE_INTEGER;
+        if (slotA !== slotB) return slotA - slotB;
+        return a.id - b.id;
+      }
+      const posDiff = (b.pos ?? 0) - (a.pos ?? 0);
+      if (posDiff !== 0 && Number.isFinite(posDiff)) return posDiff;
+      const finishA = Number.isFinite(a.finishTime) ? a.finishTime : Infinity;
+      const finishB = Number.isFinite(b.finishTime) ? b.finishTime : Infinity;
+      if (finishA !== finishB) return finishA - finishB;
+      return (a.startSlot ?? Number.MAX_SAFE_INTEGER) - (b.startSlot ?? Number.MAX_SAFE_INTEGER);
+    });
     const focusId = cameraState.targetId ?? (drivers[0]?.id ?? 0);
     tbl.innerHTML = order.map((d,idx)=>{
       const gap = d.intervalDisplay ?? (idx === 0 ? '+0.0 s' : '—');
       const spd = d.v * 3.6;
       const spdDisplay = Math.round(spd);
-      const maxPossible = Math.max(1, (d.carStats?.topSpeed ?? 360) * (d.driverStats?.topSpeed ?? 1));
-      const pct = Math.min(100, Math.round((spd / maxPossible) * 100));
+      const baseTop = Math.max(1, (d.carStats?.topSpeed ?? 360));
       const flag = `<span class="flag">${d.flag || '🏁'}</span>`;
       const isFocus = d.id === focusId;
       let name = `<strong>${d.name}</strong>`;
@@ -1298,19 +1578,36 @@
       tyreCell = `<span class="tyre-badge"><span class="tyre-ring" style="color:${ringColor}">${letter}</span><span>${tyrePct}%</span></span>`;
       }
       const lapSummary = formatLapSummary(d);
-      const speedBar = `<div class="speed-bar" style="--pct:${pct}%"><span>${spdDisplay}</span></div>`;
+      const basePercent = baseTop > 0 ? Math.min(100, Math.round((Math.min(spd, baseTop) / baseTop) * 100)) : 0;
+      const boostActive = (d.uiSpeedBoost ?? 0) > 0 && d.uiSpeedBoostSources?.some(tag => tag === 'drs' || tag === 'slipstream');
+      const penaltyActive = (d.uiSpeedPenalty ?? 0) > 0 && d.uiSpeedPenaltySources?.some(tag => tag === 'dirty-air' || tag === 'unsuccessful');
+      const penaltyWidth = penaltyActive ? Math.min(100, Math.round((d.uiSpeedPenalty ?? 0) * 100)) : 0;
+      const penaltyLeft = Math.max(0, basePercent - penaltyWidth);
+      const boostWidth = boostActive ? Math.min(100, Math.round((d.uiSpeedBoost ?? 0) * 100)) : 0;
+      const boostLeft = Math.min(100, basePercent);
+      const speedLayers = [`<div class=\"speed-fill base\" style=\"width:${basePercent}%\"></div>`];
+      if (penaltyWidth > 0) {
+        speedLayers.push(`<div class=\"speed-fill dirty\" style=\"left:${penaltyLeft}%; width:${penaltyWidth}%\"></div>`);
+      }
+      if (boostWidth > 0) {
+        speedLayers.push(`<div class=\"speed-fill boost\" style=\"left:${boostLeft}%; width:${boostWidth}%\"></div>`);
+      }
+      const speedBar = `<div class=\"speed-bar\">${speedLayers.join('')}<span>${spdDisplay}</span></div>`;
       const successCount = Math.max(0, d.overtakeSuccess ?? 0);
       const failCount = Math.max(0, d.overtakeFail ?? 0);
       const totalCount = Math.max(0, d.overtakeTotal ?? (successCount + failCount));
       const engagementCell = `<span class="total">${totalCount}</span><span class="sep">/</span><span class="success">${successCount}</span><span class="sep">/</span><span class="fail">${failCount}</span>`;
       const rowClass = isFocus ? ' class="focus"' : '';
       const startSlot = Number.isFinite(d.startSlot) ? d.startSlot : idx;
-      const change = startSlot - idx;
-      let positionDisplay = `${idx+1}`;
-      if (change > 0) {
-        positionDisplay += ` <span class="pos-change up">↑${change}</span>`;
-      } else if (change < 0) {
-        positionDisplay += ` <span class="pos-change down">↓${Math.abs(change)}</span>`;
+      const displayRank = isGridPhase && Number.isFinite(d.startSlot) ? d.startSlot + 1 : idx + 1;
+      let positionDisplay = `${displayRank}`;
+      if (!isGridPhase) {
+        const change = startSlot - idx;
+        if (change > 0) {
+          positionDisplay += ` <span class="pos-change up">↑${change}</span>`;
+        } else if (change < 0) {
+          positionDisplay += ` <span class="pos-change down">↓${Math.abs(change)}</span>`;
+        }
       }
       return `<tr data-driver="${d.id}"${rowClass}><td>${positionDisplay}</td><td>${flag}${name}${teamLine}</td><td class="interval-cell">${gap}</td><td class="tyre-cell">${tyreCell}</td><td class="overtake-cell"><span class="engagement-stats">${engagementCell}</span></td><td class="speed-cell">${speedBar}</td><td class="lap-cell">${lapSummary}</td></tr>`;
     }).join('');
@@ -1368,9 +1665,19 @@
       if (d.carStats) {
         d.carStats.tyreCondition = 1;
       }
+      if (!Array.isArray(d.tyreInventory)) {
+        d.tyreInventory = [];
+      }
+      if (Array.isArray(d.tyreHistory)) {
+        d.tyreHistory.length = 1;
+        d.tyreHistory[0] = d.carStats?.tyreCompound ?? (d.tyreHistory[0] ?? 'hard');
+      } else {
+        d.tyreHistory = [d.carStats?.tyreCompound ?? 'hard'];
+      }
       d.inPit = false;
       d.pitTimer = 0;
       d.pitLapDisplay = 0;
+      d.pitTargetCompound = null;
       d.lastPitService = null;
       d.pitJustExited = false;
       d.v = 0;
@@ -1380,6 +1687,12 @@
       d.overtakeSuccess = 0;
       d.overtakeFail = 0;
       d.segmentType = segments[0]?.type || 'straight';
+      d.segmentIndex = 0;
+      d.drsActiveSegment = null;
+      d.drsZoneId = null;
+      d.drsGranted = false;
+      d.drsEntryGap = null;
+      d.overtakePenaltySource = null;
       d.isDNF = false;
       d.overtakeBoostAccel = 0;
       d.overtakeBoostTop = 0;
