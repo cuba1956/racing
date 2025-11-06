@@ -86,6 +86,8 @@
         <option value="20">20×</option>
         <option value="50">50×</option>
       </select>
+      <label class="tiny" for="lookaheadScale">Lookahead:</label>
+      <input id="lookaheadScale" type="range" min="0.25" max="2" step="0.05" value="1" />
       <button id="btnStart">Start</button>
       <button id="btnPauseResume" disabled>Pause</button>
       <button id="btnRestart" disabled>Restart</button>
@@ -246,6 +248,7 @@
     'McLaren F1 Team':         { top: 1.0, accel: 1.01, handling: 1.01 },
     'Oracle Red Bull Racing':  { top: 0.992, accel: 0.99, handling: 0.995 }
   };
+  let lookaheadScale = 1;
 
   // Track segments: start/end in metres
   const trackBlueprint = [
@@ -405,6 +408,9 @@
     const defenceFocus = clamp(balanceSkill(data.defence ?? data.defense ?? racecraft), 0, 1);
     const driverRacecraft = clamp01(lerp(racecraft, form, 0.3));
     const driverDefense = clamp01(lerp(defenceFocus, form, 0.35));
+    const anticipationSkill = clamp01(lerp(driverHandlingFactor, driverFocus, 0.5));
+    const reactionSkill = clamp01(lerp(driverAccelFactor, racecraft, 0.45));
+    const brakeDiscipline = clamp01(driverBrakingFactor);
     const driverStats = {
       accel: clamp01(driverAccelFactor),
       topSpeed: clamp01(driverTopFactor),
@@ -413,8 +419,16 @@
       racecraft: driverRacecraft,
       defense: driverDefense,
       tyreManagement: driverTyreFactor,
-      stress: 0
+      stress: 0,
+      anticipation: anticipationSkill,
+      reaction: reactionSkill,
+      brakeDiscipline
     };
+    const baseLookaheadInterval = clamp(lerp(0.03, 0.18, 1 - anticipationSkill), 0.02, 0.22);
+    const lookaheadInterval = clamp(baseLookaheadInterval * lookaheadScale, 0.02, 0.35);
+    const perceptionError = lerp(1.5, 18, 1 - anticipationSkill);
+    const reactionLag = lerp(0.012, 0.18, 1 - reactionSkill);
+    const brakeOvershoot = lerp(0.02, 0.28, 1 - brakeDiscipline);
     return {
       id: i,
       code: data.code,
@@ -469,7 +483,15 @@
       throttle: 0,
       brake: 0,
       pedalPlan: null,
-      missedApex: 0
+      missedApex: 0,
+      baseLookaheadInterval,
+      lookaheadInterval,
+      lookaheadTimer: 0,
+      perceptionError,
+      reactionLag,
+      brakeOvershoot,
+      targetThrottle: 1,
+      targetBrakeIntent: 0
     };
   }
   function currentSegment(x) {
@@ -527,48 +549,54 @@
   function planPedalInputs(driver, context) {
     const { seg, apexInfo, topSpeed, brakeRate, dt } = context;
     const currentSpeed = Math.max(0, driver.v ?? 0);
-    const apexSpeedCurrentSeg = (seg.type === 'corner' || seg.type === 'chicane') ? segmentApexSpeed(seg) : null;
-    const distanceToApex = apexInfo ? apexInfo.distance : Infinity;
-    let throttleTarget = seg.type === 'straight' ? 1 : 0.85;
-    let brakeTarget = 0;
-    if (apexInfo) {
-      const apexSpeed = apexInfo.apexSpeed;
-      const brakingDist = brakingDistance(currentSpeed, apexSpeed, brakeRate);
-      const safety = Math.max(8, currentSpeed * 0.35);
-      if (currentSpeed > apexSpeed && (distanceToApex <= brakingDist + safety)) {
-        brakeTarget = 1;
-        throttleTarget = 0;
-      } else if (apexInfo.seg === seg && distanceToApex < 20) {
-        if (currentSpeed > apexSpeed * 1.02) {
-          brakeTarget = 1;
+    const anticipationSkill = clamp01(driver.driverStats?.anticipation ?? 0.5);
+    const reactionSkill = clamp01(driver.driverStats?.reaction ?? 0.5);
+    const discipline = clamp01(driver.driverStats?.brakeDiscipline ?? 0.5);
+    const lookaheadInterval = clamp(driver.lookaheadInterval ?? 0.06, 0.02, 0.35);
+    const perceptionErrorBase = Math.max(0, driver.perceptionError ?? 0);
+    const lookaheadTightness = clamp(1 / Math.max(0.2, lookaheadInterval), 0, 10);
+    const perceptionError = perceptionErrorBase / (0.5 + lookaheadTightness * 0.6);
+    const safetyBase = Math.max(8, currentSpeed * 0.35);
+    const safety = safetyBase / (0.6 + lookaheadTightness * 0.55);
+    const overshootFactor = Math.max(0, driver.brakeOvershoot ?? 0);
+    driver.lookaheadTimer = Math.max(0, (driver.lookaheadTimer ?? 0) - dt);
+    if (driver.lookaheadTimer <= 0) {
+      driver.lookaheadTimer = lookaheadInterval;
+      let throttleTarget = 1;
+      let brakeIntent = 0;
+      if (apexInfo) {
+        const apexSpeed = apexInfo.apexSpeed;
+        const perceptionScale = 0.6 + currentSpeed * 0.009;
+        const effectiveDistance = apexInfo.distance + perceptionError * perceptionScale;
+        const brakingDist = brakingDistance(currentSpeed, apexSpeed, brakeRate);
+        if (currentSpeed > apexSpeed && (effectiveDistance <= (brakingDist + safety))) {
+          brakeIntent = 1;
           throttleTarget = 0;
-        } else if (currentSpeed >= apexSpeed) {
-          throttleTarget = Math.min(throttleTarget, 0.2);
+        } else if (apexInfo.seg === seg) {
+          const lateBrakeAllowance = 1 + overshootFactor * 0.25 * Math.max(1, lookaheadTightness * 0.9);
+          if (currentSpeed > apexSpeed * lateBrakeAllowance) {
+            brakeIntent = 1;
+            throttleTarget = 0;
+          } else if (currentSpeed > apexSpeed) {
+            const cautiousBlend = clamp(0.35 + discipline * 0.4, 0.3, 0.7);
+            throttleTarget = Math.min(throttleTarget, cautiousBlend);
+          }
         }
       }
-    }
-    if (!brakeTarget && apexSpeedCurrentSeg != null) {
-      if (currentSpeed > apexSpeedCurrentSeg * 1.02) {
-        brakeTarget = 1;
-        throttleTarget = 0;
-      } else if (currentSpeed > apexSpeedCurrentSeg * 0.98) {
-        throttleTarget = Math.min(throttleTarget, 0.35);
+      if (!brakeIntent) {
+        if (currentSpeed >= topSpeed * 0.995) {
+          throttleTarget = Math.min(throttleTarget, 0.05);
+        } else if (currentSpeed >= topSpeed * 0.97) {
+          throttleTarget = Math.min(throttleTarget, 0.35);
+        }
       }
+      driver.targetThrottle = throttleTarget;
+      driver.targetBrakeIntent = brakeIntent;
     }
-    if (!brakeTarget) {
-      if (currentSpeed >= topSpeed * 0.995) {
-        throttleTarget = Math.min(throttleTarget, 0.05);
-      } else if (currentSpeed >= topSpeed * 0.97) {
-        throttleTarget = Math.min(throttleTarget, 0.35);
-      }
-    }
-    if (brakeTarget) {
-      driver.throttle = Math.max(0, (driver.throttle ?? 0) - dt * 5);
-    }
-    const ramp = brakeTarget ? dt * 6 : dt * 2;
-    const nextThrottle = approach(driver.throttle ?? 0, clamp(throttleTarget, 0, 1), ramp);
-    driver.throttle = clamp(nextThrottle, 0, 1);
-    driver.brake = brakeTarget ? 1 : 0;
+    const throttleGoal = clamp(driver.targetThrottle ?? 1, 0, 1);
+    const brakeGoal = clamp(driver.targetBrakeIntent ?? 0, 0, 1);
+    driver.throttle = throttleGoal;
+    driver.brake = brakeGoal;
     driver.pedalPlan = apexInfo;
     return {
       throttle: driver.throttle,
@@ -590,6 +618,7 @@
   const speedGraphSurface = document.querySelector('.speed-graph-surface');
   const speedGraphCanvas = document.getElementById('speedGraph');
   const speedGraphCtx = speedGraphCanvas ? speedGraphCanvas.getContext('2d') : null;
+  const lookaheadScaleInput = document.getElementById('lookaheadScale');
   const speedGraphState = {
     points: [],
     prevPoints: [],
@@ -598,14 +627,21 @@
     lastLapPos: 0,
     dpr: 1,
   };
-  const SPEED_GRAPH_MIN_STEP = 0.0015;
-  const SPEED_GRAPH_MAX_POINTS = 1500;
+  const SPEED_GRAPH_MIN_STEP = 0.0006;
+  const SPEED_GRAPH_MAX_POINTS = 4000;
   let speedGraphReady = false;
   const sessionModeSel = document.getElementById('sessionMode');
   let sessionMode = sessionModeSel?.value || 'practice';
   const simSpeedSel = document.getElementById('simSpeed');
   let simSpeed = 1;
   simSpeedSel.addEventListener('change',()=>{ simSpeed = parseFloat(simSpeedSel.value); });
+  if (lookaheadScaleInput) {
+    const initialScale = parseFloat(lookaheadScaleInput.value);
+    if (Number.isFinite(initialScale)) {
+      lookaheadScale = initialScale;
+      lookaheadScaleInput.title = `${initialScale.toFixed(2)}×`;
+    }
+  }
   sessionModeSel?.addEventListener('change', () => {
     setSessionMode(sessionModeSel.value);
   });
@@ -861,6 +897,9 @@
       d.brake = 0;
       d.pedalPlan = null;
       d.missedApex = 0;
+      d.lookaheadTimer = 0;
+      d.targetThrottle = 1;
+      d.targetBrakeIntent = 0;
     }
   }
 
@@ -1379,7 +1418,23 @@
   }
 
   // ---- CORE LOOP ----
+  function applyLookaheadScaleToDrivers(list) {
+    if (!Array.isArray(list)) return;
+    for (const drv of list) {
+      if (!drv) continue;
+      const base = Number.isFinite(drv.baseLookaheadInterval) ? drv.baseLookaheadInterval : (drv.lookaheadInterval ?? 0.06);
+      const scaled = clamp(base * lookaheadScale, 0.02, 0.35);
+      drv.lookaheadInterval = scaled;
+      if (typeof drv.lookaheadTimer === 'number') {
+        drv.lookaheadTimer = Math.min(Math.max(0, drv.lookaheadTimer), scaled);
+      } else {
+        drv.lookaheadTimer = 0;
+      }
+    }
+  }
+
   let drivers = createDriversForMode(sessionMode);
+  applyLookaheadScaleToDrivers(drivers);
   applyGridPositions(drivers);
   cameraState.targetId = drivers[0]?.id ?? 0;
   resetSpeedGraph(drivers[0] ?? null);
@@ -1390,6 +1445,18 @@
   let simTime = 0;          // simulated race time in seconds
   let lastT = 0, acc = 0;   // accumulator for fixed-step
   updateSegmentInfoForPlayer();
+
+  if (lookaheadScaleInput) {
+    const handleLookaheadScaleChange = () => {
+      const raw = parseFloat(lookaheadScaleInput.value);
+      if (!Number.isFinite(raw)) return;
+      lookaheadScale = Math.max(0.1, Math.min(3, raw));
+      lookaheadScaleInput.title = `${lookaheadScale.toFixed(2)}×`;
+      applyLookaheadScaleToDrivers(drivers);
+    };
+    lookaheadScaleInput.addEventListener('input', handleLookaheadScaleChange);
+    lookaheadScaleInput.addEventListener('change', handleLookaheadScaleChange);
+  }
 
   function step(dt) {
     acc += dt * simSpeed;
@@ -2276,6 +2343,9 @@
       d.brake = 0;
       d.pedalPlan = null;
       d.missedApex = 0;
+      d.lookaheadTimer = 0;
+      d.targetThrottle = 1;
+      d.targetBrakeIntent = 0;
     });
     if (drivers.length) drivers[0].intervalDisplay = '+0.0 s';
     resetSpeedGraph(drivers[0] ?? null);
@@ -2307,6 +2377,7 @@
 
   function restartRace() {
     drivers = createDriversForMode(sessionMode);
+    applyLookaheadScaleToDrivers(drivers);
     applyGridPositions(drivers);
     cameraState.targetId = drivers[0]?.id ?? cameraState.targetId ?? 0;
     resetSpeedGraph(drivers[0] ?? null);
