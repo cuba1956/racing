@@ -1703,9 +1703,9 @@
       const brake = pedals.brake ? 1 : 0;
       const prevV = d.v;
       let effectiveAccel = accelRate * throttle;
-      if (throttle > 0 && throttle < 0.2) {
-        effectiveAccel *= 0.85 + throttle * 0.75;
-      }
+      const speedRatio = topSpeed > 0 ? clamp(prevV / topSpeed, 0, 1) : 0;
+      const saturation = speedRatio * speedRatio * speedRatio;
+      effectiveAccel *= Math.max(0, 1 - saturation * 0.98);
       let decel = brake ? brakeRate : 0;
       if (!brake && throttle < 0.05) {
         decel = Math.max(decel, 2 + 3 * (prevV / Math.max(1, topSpeed)));
