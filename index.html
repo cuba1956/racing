@@ -1446,6 +1446,8 @@
     acc += dt * simSpeed;
     while (acc >= TICK_RATE) {
       integrate(TICK_RATE);
+      const focusForGraph = getFocusDriver();
+      if (focusForGraph) sampleSpeedGraph(focusForGraph);
       acc -= TICK_RATE;
       simTime += TICK_RATE;
       if (paused) {
