@@ -409,8 +409,6 @@
     const driverRacecraft = clamp01(lerp(racecraft, form, 0.3));
     const driverDefense = clamp01(lerp(defenceFocus, form, 0.35));
     const anticipationSkill = clamp01(lerp(driverHandlingFactor, driverFocus, 0.5));
-    const reactionSkill = clamp01(lerp(driverAccelFactor, racecraft, 0.45));
-    const brakeDiscipline = clamp01(driverBrakingFactor);
     const driverStats = {
       accel: clamp01(driverAccelFactor),
       topSpeed: clamp01(driverTopFactor),
@@ -419,16 +417,10 @@
       racecraft: driverRacecraft,
       defense: driverDefense,
       tyreManagement: driverTyreFactor,
-      stress: 0,
-      anticipation: anticipationSkill,
-      reaction: reactionSkill,
-      brakeDiscipline
+      stress: 0
     };
     const baseLookaheadInterval = clamp(lerp(0.03, 0.18, 1 - anticipationSkill), 0.02, 0.22);
     const lookaheadInterval = clamp(baseLookaheadInterval * lookaheadScale, 0.02, 0.35);
-    const perceptionError = lerp(1.5, 18, 1 - anticipationSkill);
-    const reactionLag = lerp(0.012, 0.18, 1 - reactionSkill);
-    const brakeOvershoot = lerp(0.02, 0.28, 1 - brakeDiscipline);
     return {
       id: i,
       code: data.code,
@@ -487,11 +479,9 @@
       baseLookaheadInterval,
       lookaheadInterval,
       lookaheadTimer: 0,
-      perceptionError,
-      reactionLag,
-      brakeOvershoot,
       targetThrottle: 1,
-      targetBrakeIntent: 0
+      targetBrakeIntent: 0,
+      brakingForApex: false
     };
   }
   function currentSegment(x) {
@@ -547,18 +537,11 @@
     return target;
   }
   function planPedalInputs(driver, context) {
-    const { seg, apexInfo, topSpeed, brakeRate, dt } = context;
+    const { seg, apexInfo, brakeRate, dt } = context;
     const currentSpeed = Math.max(0, driver.v ?? 0);
-    const anticipationSkill = clamp01(driver.driverStats?.anticipation ?? 0.5);
-    const reactionSkill = clamp01(driver.driverStats?.reaction ?? 0.5);
-    const discipline = clamp01(driver.driverStats?.brakeDiscipline ?? 0.5);
     const lookaheadInterval = clamp(driver.lookaheadInterval ?? 0.06, 0.02, 0.35);
-    const perceptionErrorBase = Math.max(0, driver.perceptionError ?? 0);
-    const lookaheadTightness = clamp(1 / Math.max(0.2, lookaheadInterval), 0, 10);
-    const perceptionError = perceptionErrorBase / (0.5 + lookaheadTightness * 0.6);
-    const safetyBase = Math.max(8, currentSpeed * 0.35);
-    const safety = safetyBase / (0.6 + lookaheadTightness * 0.55);
-    const overshootFactor = Math.max(0, driver.brakeOvershoot ?? 0);
+    const LOOKAHEAD_METERS = 50;
+    const BRAKE_RELEASE_FACTOR = 1.02;
     driver.lookaheadTimer = Math.max(0, (driver.lookaheadTimer ?? 0) - dt);
     if (driver.lookaheadTimer <= 0) {
       driver.lookaheadTimer = lookaheadInterval;
@@ -566,28 +549,28 @@
       let brakeIntent = 0;
       if (apexInfo) {
         const apexSpeed = apexInfo.apexSpeed;
-        const perceptionScale = 0.6 + currentSpeed * 0.009;
-        const effectiveDistance = apexInfo.distance + perceptionError * perceptionScale;
-        const brakingDist = brakingDistance(currentSpeed, apexSpeed, brakeRate);
-        if (currentSpeed > apexSpeed && (effectiveDistance <= (brakingDist + safety))) {
-          brakeIntent = 1;
-          throttleTarget = 0;
-        } else if (apexInfo.seg === seg) {
-          const lateBrakeAllowance = 1 + overshootFactor * 0.25 * Math.max(1, lookaheadTightness * 0.9);
-          if (currentSpeed > apexSpeed * lateBrakeAllowance) {
-            brakeIntent = 1;
-            throttleTarget = 0;
-          } else if (currentSpeed > apexSpeed) {
-            const cautiousBlend = clamp(0.35 + discipline * 0.4, 0.3, 0.7);
-            throttleTarget = Math.min(throttleTarget, cautiousBlend);
+        const horizon = LOOKAHEAD_METERS;
+        const distToApex = apexInfo.distance;
+        let shouldBrake = false;
+        if (brakeRate > 0 && distToApex <= horizon) {
+          const currentSpeedSq = currentSpeed * currentSpeed;
+          const apexSpeedSq = apexSpeed * apexSpeed;
+          const brakingDistanceNeeded = Math.max(0, (currentSpeedSq - apexSpeedSq) / (2 * brakeRate));
+          if (brakingDistanceNeeded > Math.max(0, distToApex - 1.5)) {
+            shouldBrake = true;
           }
         }
-      }
-      if (!brakeIntent) {
-        if (currentSpeed >= topSpeed * 0.995) {
-          throttleTarget = Math.min(throttleTarget, 0.05);
-        } else if (currentSpeed >= topSpeed * 0.97) {
-          throttleTarget = Math.min(throttleTarget, 0.35);
+        const currentlyBraking = !!driver.brakingForApex;
+        if (currentlyBraking) {
+          if (distToApex <= 0 || currentSpeed <= apexSpeed * BRAKE_RELEASE_FACTOR) {
+            driver.brakingForApex = false;
+          }
+        } else if (shouldBrake) {
+          driver.brakingForApex = true;
+        }
+        if (driver.brakingForApex) {
+          brakeIntent = 1;
+          throttleTarget = 0;
         }
       }
       driver.targetThrottle = throttleTarget;
@@ -900,6 +883,7 @@
       d.lookaheadTimer = 0;
       d.targetThrottle = 1;
       d.targetBrakeIntent = 0;
+      d.brakingForApex = false;
     }
   }
 
@@ -2346,6 +2330,7 @@
       d.lookaheadTimer = 0;
       d.targetThrottle = 1;
       d.targetBrakeIntent = 0;
+      d.brakingForApex = false;
     });
     if (drivers.length) drivers[0].intervalDisplay = '+0.0 s';
     resetSpeedGraph(drivers[0] ?? null);
