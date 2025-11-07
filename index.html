@@ -485,6 +485,7 @@
       targetThrottle: 1,
       targetBrakeIntent: 0,
       brakingForApex: false,
+      previousApex: null,
       activeApex: null,
       brakePrediction: null
     };
@@ -572,6 +573,20 @@
     }
     return { distance, time, finalSpeed: v, iterations };
   }
+  function applyThrottleCurve(progress, curveValue, minOutput, maxOutput) {
+    const p = clamp(progress, 0, 1);
+    const minOut = Math.min(minOutput, maxOutput);
+    const maxOut = Math.max(minOutput, maxOutput);
+    if (maxOut - minOut <= 1e-6) return maxOut;
+    const c = Number.isFinite(curveValue) ? curveValue : 0;
+    let shaped;
+    if (c >= 0) {
+      shaped = Math.pow(p, 1 + c);
+    } else {
+      shaped = 1 - Math.pow(1 - p, 1 - c);
+    }
+    return clamp(minOut + (maxOut - minOut) * shaped, minOut, maxOut);
+  }
   function planPedalInputs(driver, context) {
     const { seg, apexInfo, brakeRate, dt } = context;
     const currentSpeed = Math.max(0, driver.v ?? 0);
@@ -589,6 +604,7 @@
     if (activeApex) {
       const distanceToActive = activeApex.apexAbs - absPos;
       if (distanceToActive <= -EXIT_APEX_BUFFER && !driver.brakingForApex) {
+        driver.previousApex = activeApex;
         activeApex = null;
       }
     }
@@ -606,12 +622,39 @@
       };
     }
     driver.activeApex = activeApex;
+    const previousApex = driver.previousApex;
     driver.lookaheadTimer = Math.max(0, (driver.lookaheadTimer ?? 0) - dt);
     if (driver.lookaheadTimer <= 0) {
       driver.lookaheadTimer = lookaheadInterval;
       let throttleTarget = 1;
       let brakeIntent = 0;
       let brakePrediction = null;
+      let throttleCurveInfo = null;
+      if (!driver.brakingForApex && previousApex && apexTarget && previousApex.seg && apexTarget.seg) {
+        const prevIdx = segments.indexOf(previousApex.seg);
+        const targetIdx = segments.indexOf(apexTarget.seg);
+        const prevIsCorner = previousApex.seg.type === 'corner' || previousApex.seg.type === 'chicane';
+        const nextIsCorner = apexTarget.seg.type === 'corner' || apexTarget.seg.type === 'chicane';
+        const contiguous = prevIdx >= 0 && targetIdx === prevIdx + 1;
+        const betweenApexes = absPos >= previousApex.apexAbs && absPos <= apexTarget.apexAbs;
+        if (prevIsCorner && nextIsCorner && contiguous && betweenApexes) {
+          const deltaSpeed = apexTarget.apexSpeed - previousApex.apexSpeed;
+          const carGripMult = (driver.carStats?.tyreGripMult ?? 1) * (driver.carStats?.tyreCondition ?? 1);
+          const currentGrip = (apexTarget.seg.grip ?? 0.65) * carGripMult;
+          const gripNorm = clamp(currentGrip / 1.35, 0, 1);
+          const gripCurve = 1 - gripNorm; // lower grip -> higher curve
+          const deltaRatio = clamp(Math.abs(deltaSpeed) / Math.max(previousApex.apexSpeed, 1), 0, 1);
+          const handling = clamp(driver.driverStats?.handling ?? 0.5, 0, 1);
+          const baseCurve = deltaSpeed >= 0 ? 0.8 : 1.4;
+          const curveValue = baseCurve + gripCurve * 1.6 + deltaRatio * (deltaSpeed >= 0 ? 0.5 : 1.0) + (1 - handling) * 0.6;
+          throttleCurveInfo = {
+            prev: previousApex,
+            next: apexTarget,
+            curve: curveValue,
+            harder: deltaSpeed < 0
+          };
+        }
+      }
       if (apexTarget) {
         const apexSpeed = apexTarget.apexSpeed;
         const horizon = LOOKAHEAD_METERS;
@@ -643,6 +686,15 @@
           brakeIntent = 1;
           throttleTarget = 0;
         }
+      }
+      if (throttleCurveInfo && !driver.brakingForApex) {
+        const prevApex = throttleCurveInfo.prev;
+        const nextApex = throttleCurveInfo.next;
+        const span = Math.max(1, nextApex.apexAbs - prevApex.apexAbs);
+        const progress = clamp((absPos - prevApex.apexAbs) / span, 0, 1);
+        const minOutput = throttleCurveInfo.harder ? 0 : 0.05;
+        const modulated = applyThrottleCurve(progress, throttleCurveInfo.curve, minOutput, throttleTarget);
+        throttleTarget = Math.min(throttleTarget, modulated);
       }
       driver.targetThrottle = throttleTarget;
       driver.targetBrakeIntent = brakeIntent;
@@ -951,6 +1003,7 @@
       d.throttle = 0;
       d.brake = 0;
       d.pedalPlan = null;
+      d.previousApex = null;
       d.activeApex = null;
       d.missedApex = 0;
       d.lookaheadTimer = 0;
@@ -1786,7 +1839,11 @@
       effectiveAccel *= Math.max(0, 1 - saturation * 0.98);
       let decel = brake ? brakeRate : 0;
       if (!brake && throttle < 0.05) {
-        decel = Math.max(decel, 2 + 3 * (prevV / Math.max(1, topSpeed)));
+        const isStraight = seg.type === 'straight';
+        const baseDrag = isStraight ? 1.4 : 2.3;
+        const ratioDrag = isStraight ? 2.2 : 3.6;
+        const coastDecel = baseDrag + ratioDrag * speedRatio;
+        decel = Math.max(decel, coastDecel);
       }
       let nextV = prevV + (effectiveAccel - decel) * dt;
       if (nextV < 0) nextV = 0;
@@ -2404,6 +2461,7 @@
       d.throttle = 0;
       d.brake = 0;
       d.pedalPlan = null;
+      d.previousApex = null;
       d.activeApex = null;
       d.missedApex = 0;
       d.lookaheadTimer = 0;
