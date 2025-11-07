@@ -86,8 +86,8 @@
         <option value="20">20×</option>
         <option value="50">50×</option>
       </select>
-      <label class="tiny" for="lookaheadScale">Lookahead:</label>
-      <input id="lookaheadScale" type="range" min="0.25" max="2" step="0.05" value="1" />
+      <label class="tiny" for="lookaheadScale">Lookahead: <span id="lookaheadValue">—</span></label>
+      <input id="lookaheadScale" type="range" min="0.5" max="2" step="0.05" value="1" />
       <button id="btnStart">Start</button>
       <button id="btnPauseResume" disabled>Pause</button>
       <button id="btnRestart" disabled>Restart</button>
@@ -176,6 +176,7 @@
     return indexes.map(idx => makeDriver(idx));
   }
   const TICK_RATE = 1/60;          // fixed-step integration
+  const NET_ACCEL_FILTER_TAU = 0.2;
   const VIEW_PADDING_PX = 36;
   const GRID_SPACING_M = 10;
   const GRID_LANE_FACTOR = 0.6;
@@ -294,6 +295,7 @@
   const rawTrackLength = trackBlueprint.reduce((sum, piece) => sum + piece.length, 0);
   const trackScale = TRACK_LENGTH_M / rawTrackLength;
   let trackCursor = 0;
+  let cornerCounter = 0;
   const segments = trackBlueprint.map((piece, index) => {
     const remainingTrack = TRACK_LENGTH_M - trackCursor;
     const remainingSegments = trackBlueprint.length - index - 1;
@@ -310,9 +312,12 @@
     const end = start + segmentLength;
     trackCursor = end;
     if (piece.type === 'corner') {
+      const cornerIndex = ++cornerCounter;
       const grip = cornerGripFromSpeed(piece.speed);
       const difficulty = cornerDifficultyFromSpeed(piece.speed);
-      return seg('corner', start, end, grip, difficulty, false, null, piece.direction, piece.speed);
+      const cornerSeg = seg('corner', start, end, grip, difficulty, false, null, piece.direction, piece.speed);
+      cornerSeg.cornerIndex = cornerIndex;
+      return cornerSeg;
     }
     return seg(piece.type, start, end, 1.0, piece.difficulty, !!piece.drs, piece.drsId || null, piece.direction ?? null, piece.speed ?? null);
   });
@@ -342,7 +347,8 @@
   const cornerMarkers = segments
     .filter(seg => seg.type === 'corner')
     .map((seg, idx) => ({
-      index: idx + 1,
+      index: seg.cornerIndex ?? (idx + 1),
+      cornerIndex: seg.cornerIndex ?? (idx + 1),
       start: seg.start,
       apex: seg.start + (seg.end - seg.start) * 0.5,
       apexSpeed: seg.cornerSpeedMs ?? (Number.isFinite(seg.cornerSpeedKmh) ? seg.cornerSpeedKmh / 3.6 : null)
@@ -419,10 +425,10 @@
       tyreManagement: driverTyreFactor,
       stress: 0
     };
-    const baseLookaheadMin = isPlayer ? 0.005 : 0.02;
+    const baseLookaheadMin = isPlayer ? 0.02 : 0.02;
     const baseLookaheadInterval = clamp(lerp(0.03, 0.18, 1 - anticipationSkill), baseLookaheadMin, 0.22);
     const lookaheadScaleForDriver = isPlayer ? lookaheadScale : 1;
-    const minLookaheadInterval = isPlayer ? 0.005 : 0.02;
+    const minLookaheadInterval = isPlayer ? 0.02 : 0.02;
     const lookaheadInterval = clamp(baseLookaheadInterval * lookaheadScaleForDriver, minLookaheadInterval, 0.35);
     return {
       id: i,
@@ -548,7 +554,9 @@
     brakeRate,
     step = TICK_RATE,
     maxTime = 5,
-    maxDistance = Infinity
+    maxDistance = Infinity,
+    initialNetAccel = 0,
+    filterTau = NET_ACCEL_FILTER_TAU
   }) {
     const effectiveRate = Math.max(0, brakeRate || 0);
     if (!Number.isFinite(effectiveRate) || effectiveRate <= 0) {
@@ -562,9 +570,18 @@
     let distance = 0;
     let time = 0;
     let iterations = 0;
+    let prevNet = Number.isFinite(initialNetAccel) ? initialNetAccel : 0;
+    const useFilter = Number.isFinite(filterTau) && filterTau > 1e-6;
     while (v > target && time < limitTime && distance < limitDistance) {
       iterations++;
-      const nextV = Math.max(0, v - effectiveRate * dt);
+      const rawNet = -effectiveRate;
+      let appliedNet = rawNet;
+      if (useFilter) {
+        const alpha = clamp(dt / filterTau, 0, 1);
+        appliedNet = prevNet + (rawNet - prevNet) * alpha;
+        prevNet = appliedNet;
+      }
+      const nextV = Math.max(0, v + appliedNet * dt);
       const avgV = (v + nextV) * 0.5;
       distance += Math.max(0, avgV * dt);
       time += dt;
@@ -587,12 +604,29 @@
     }
     return clamp(minOut + (maxOut - minOut) * shaped, minOut, maxOut);
   }
+  const APEX_SUCCESS_MARGIN_MS = 5 / 3.6;
+  function throttleResponseMultiplier(throttleInput, speedRatio, seg) {
+    const demand = clamp01(Number.isFinite(throttleInput) ? throttleInput : 0);
+    if (demand <= 0) return 1;
+    const ratio = clamp(Number.isFinite(speedRatio) ? speedRatio : 0, 0, 1.3);
+    const norm = Math.min(1, ratio);
+    const smooth = norm * norm * (3 - 2 * norm); // smoothstep for continuous slope
+    const demandEase = 1 - Math.exp(-demand * 3.2);
+    const basePenalty = smooth * demandEase * 0.6;
+    const bleed = norm * norm * 0.08;
+    const grip = clamp(seg?.grip ?? (seg?.type === 'straight' ? 1 : 0.75), 0.4, 1.15);
+    const gripNorm = clamp((grip - 0.4) / 0.75, 0, 1);
+    const gripPenalty = (1 - gripNorm) * 0.06;
+    const multiplier = (1 - basePenalty - gripPenalty) * (1 - bleed);
+    const floor = 0.15;
+    return clamp(multiplier, floor, 1);
+  }
   function planPedalInputs(driver, context) {
     const { seg, apexInfo, brakeRate, dt } = context;
     const currentSpeed = Math.max(0, driver.v ?? 0);
-    const minInterval = driver.isPlayer ? 0.005 : 0.02;
+    const minInterval = driver.isPlayer ? 0.02 : 0.02;
     const lookaheadInterval = clamp(driver.lookaheadInterval ?? 0.06, minInterval, 0.35);
-    const LOOKAHEAD_METERS = 120;
+    const LOOKAHEAD_METERS = 200;
     const BRAKE_RELEASE_FACTOR = 1.02;
     const EXIT_APEX_BUFFER = 8;
     const absPos = driver.pos ?? 0;
@@ -667,7 +701,9 @@
             brakeRate,
             step: Math.min(dt, TICK_RATE),
             maxTime: 6,
-            maxDistance: distToApex + 10
+            maxDistance: distToApex + 10,
+            initialNetAccel: driver.netAccel ?? 0,
+            filterTau: NET_ACCEL_FILTER_TAU
           });
           const predictedDistance = brakePrediction?.distance ?? Infinity;
           if (predictedDistance > Math.max(0, distToApex - 1.5)) {
@@ -676,7 +712,7 @@
         }
         const currentlyBraking = !!driver.brakingForApex;
         if (currentlyBraking) {
-          if (distToApex <= 0 || currentSpeed <= apexSpeed * BRAKE_RELEASE_FACTOR) {
+          if (distToApex <= 0 || currentSpeed <= apexSpeed + APEX_SUCCESS_MARGIN_MS) {
             driver.brakingForApex = false;
           }
         } else if (shouldBrake) {
@@ -726,6 +762,12 @@
   const speedGraphCanvas = document.getElementById('speedGraph');
   const speedGraphCtx = speedGraphCanvas ? speedGraphCanvas.getContext('2d') : null;
   const lookaheadScaleInput = document.getElementById('lookaheadScale');
+  const lookaheadScaleMin = (() => {
+    if (!lookaheadScaleInput) return 0.5;
+    const parsed = parseFloat(lookaheadScaleInput.min);
+    return Number.isFinite(parsed) ? parsed : 0.5;
+  })();
+  const lookaheadValueEl = document.getElementById('lookaheadValue');
   const speedGraphState = {
     points: [],
     prevPoints: [],
@@ -733,6 +775,11 @@
     lastLap: null,
     lastLapPos: 0,
     dpr: 1,
+  };
+  const speedGraphHover = {
+    active: false,
+    ratio: 0,
+    point: null,
   };
   const SPEED_GRAPH_MIN_STEP = 0.0006;
   const SPEED_GRAPH_MAX_POINTS = 4000;
@@ -745,9 +792,16 @@
   if (lookaheadScaleInput) {
     const initialScale = parseFloat(lookaheadScaleInput.value);
     if (Number.isFinite(initialScale)) {
-      lookaheadScale = initialScale;
-      lookaheadScaleInput.title = `${initialScale.toFixed(2)}×`;
+      lookaheadScale = Math.max(lookaheadScaleMin, Math.min(3, initialScale));
+      lookaheadScaleInput.value = lookaheadScale.toString();
+      lookaheadScaleInput.title = `${lookaheadScale.toFixed(2)}×`;
     }
+  }
+  function updateLookaheadDisplay() {
+    if (!lookaheadValueEl) return;
+    const player = drivers.find(d => d.isPlayer) || drivers[0];
+    const interval = player?.lookaheadInterval ?? player?.baseLookaheadInterval ?? 0.06;
+    lookaheadValueEl.textContent = `${(interval * 1000).toFixed(1)} ms`;
   }
   sessionModeSel?.addEventListener('change', () => {
     setSessionMode(sessionModeSel.value);
@@ -821,6 +875,118 @@
     }
   });
   resizeSpeedGraph();
+
+  function getSpeedGraphLayout() {
+    if (!speedGraphCanvas) return null;
+    const width = speedGraphCanvas.width;
+    const height = speedGraphCanvas.height;
+    if (!width || !height) return null;
+    const dpr = speedGraphState.dpr || Math.max(1, window.devicePixelRatio || 1);
+    const plotPadding = {
+      left: 52 * dpr,
+      right: 18 * dpr,
+      top: 22 * dpr,
+      bottom: 28 * dpr,
+    };
+    const plotWidth = Math.max(1, width - plotPadding.left - plotPadding.right);
+    const plotHeight = Math.max(1, height - plotPadding.top - plotPadding.bottom);
+    return { width, height, dpr, plotPadding, plotWidth, plotHeight };
+  }
+
+  function findNearestSpeedPoint(ratio) {
+    const pts = speedGraphState.points;
+    if (!Array.isArray(pts) || pts.length === 0) return null;
+    const target = clamp(Number.isFinite(ratio) ? ratio : 0, 0, 1);
+    let nearest = pts[0];
+    let minDist = Math.abs(target - clamp(nearest?.x ?? 0, 0, 1));
+    for (let i = 1; i < pts.length; i++) {
+      const candidate = pts[i];
+      const dist = Math.abs(target - clamp(candidate?.x ?? 0, 0, 1));
+      if (dist < minDist) {
+        minDist = dist;
+        nearest = candidate;
+      }
+    }
+    return nearest;
+  }
+
+  function clearSpeedGraphHover() {
+    speedGraphHover.active = false;
+    speedGraphHover.ratio = 0;
+    speedGraphHover.point = null;
+  }
+
+  function updateSpeedGraphHoverPosition(clientX, clientY) {
+    if (!speedGraphSurface || !speedGraphCanvas) {
+      clearSpeedGraphHover();
+      return;
+    }
+    if (!speedGraphCanvas.width || !speedGraphCanvas.height) {
+      if (!resizeSpeedGraph()) {
+        clearSpeedGraphHover();
+        return;
+      }
+    }
+    const layout = getSpeedGraphLayout();
+    if (!layout) {
+      clearSpeedGraphHover();
+      return;
+    }
+    const rect = speedGraphSurface.getBoundingClientRect();
+    if (!rect.width || !rect.height) {
+      clearSpeedGraphHover();
+      return;
+    }
+    const relX = (clientX - rect.left) / rect.width;
+    const relY = (clientY - rect.top) / rect.height;
+    if (!Number.isFinite(relX) || !Number.isFinite(relY)) {
+      clearSpeedGraphHover();
+      return;
+    }
+    const canvasX = relX * layout.width;
+    const canvasY = relY * layout.height;
+    const withinPlot =
+      canvasX >= layout.plotPadding.left &&
+      canvasX <= layout.width - layout.plotPadding.right &&
+      canvasY >= layout.plotPadding.top &&
+      canvasY <= layout.height - layout.plotPadding.bottom;
+    if (!withinPlot) {
+      clearSpeedGraphHover();
+      return;
+    }
+    const ratio = clamp((canvasX - layout.plotPadding.left) / layout.plotWidth, 0, 1);
+    const nearest = findNearestSpeedPoint(ratio);
+    if (!nearest) {
+      clearSpeedGraphHover();
+      return;
+    }
+    const clampedX = clamp(nearest.x ?? ratio, 0, 1);
+    speedGraphHover.active = true;
+    speedGraphHover.ratio = clampedX;
+    speedGraphHover.point = {
+      x: clampedX,
+      speed: Number.isFinite(nearest.speed) ? nearest.speed : 0,
+      throttle: Number.isFinite(nearest.throttle) ? nearest.throttle : 0,
+      brake: Number.isFinite(nearest.brake) ? nearest.brake : 0,
+    };
+  }
+
+  if (speedGraphSurface) {
+    speedGraphSurface.addEventListener('mousemove', (evt) => {
+      updateSpeedGraphHoverPosition(evt.clientX, evt.clientY);
+    });
+    speedGraphSurface.addEventListener('mouseleave', () => {
+      clearSpeedGraphHover();
+    });
+    speedGraphSurface.addEventListener('touchmove', (evt) => {
+      const touch = evt.touches && evt.touches[0];
+      if (!touch) return;
+      updateSpeedGraphHoverPosition(touch.clientX, touch.clientY);
+    }, { passive: true });
+    const clearTouchHover = () => clearSpeedGraphHover();
+    speedGraphSurface.addEventListener('touchend', clearTouchHover);
+    speedGraphSurface.addEventListener('touchcancel', clearTouchHover);
+  }
 
   function resetSpeedGraph(driver = null) {
     speedGraphState.points = [];
@@ -1000,8 +1166,10 @@
       d.lastLapTime = null;
       d.bestLapTime = Infinity;
       d.lapTimes = [];
+      d.apexOverspeedCorners = new Set();
       d.throttle = 0;
       d.brake = 0;
+      d.netAccel = 0;
       d.pedalPlan = null;
       d.previousApex = null;
       d.activeApex = null;
@@ -1535,7 +1703,7 @@
       if (!drv) continue;
       const base = Number.isFinite(drv.baseLookaheadInterval) ? drv.baseLookaheadInterval : (drv.lookaheadInterval ?? 0.06);
       const scale = drv.isPlayer ? lookaheadScale : 1;
-      const minInterval = drv.isPlayer ? 0.005 : 0.02;
+      const minInterval = drv.isPlayer ? 0.02 : 0.02;
       const scaled = clamp(base * scale, minInterval, 0.35);
       drv.lookaheadInterval = scaled;
       if (typeof drv.lookaheadTimer === 'number') {
@@ -1544,6 +1712,7 @@
         drv.lookaheadTimer = 0;
       }
     }
+    updateLookaheadDisplay();
   }
 
   let drivers = createDriversForMode(sessionMode);
@@ -1563,12 +1732,15 @@
     const handleLookaheadScaleChange = () => {
       const raw = parseFloat(lookaheadScaleInput.value);
       if (!Number.isFinite(raw)) return;
-      lookaheadScale = Math.max(0.1, Math.min(3, raw));
+      lookaheadScale = Math.max(lookaheadScaleMin, Math.min(3, raw));
       lookaheadScaleInput.title = `${lookaheadScale.toFixed(2)}×`;
       applyLookaheadScaleToDrivers(drivers);
     };
     lookaheadScaleInput.addEventListener('input', handleLookaheadScaleChange);
     lookaheadScaleInput.addEventListener('change', handleLookaheadScaleChange);
+    updateLookaheadDisplay();
+  } else {
+    updateLookaheadDisplay();
   }
 
   function step(dt) {
@@ -1833,8 +2005,12 @@
       const throttle = clamp01(pedals.throttle);
       const brake = pedals.brake ? 1 : 0;
       const prevV = d.v;
+      const rawSpeedRatio = topSpeed > 0 ? prevV / topSpeed : 0;
+      const speedRatio = clamp(rawSpeedRatio, 0, 1);
       let effectiveAccel = accelRate * throttle;
-      const speedRatio = topSpeed > 0 ? clamp(prevV / topSpeed, 0, 1) : 0;
+      const responseMult = throttleResponseMultiplier(throttle, rawSpeedRatio, seg);
+      // Applies diminishing returns at high speed/high demand without touching the target top speed.
+      effectiveAccel *= responseMult;
       const saturation = speedRatio * speedRatio * speedRatio;
       effectiveAccel *= Math.max(0, 1 - saturation * 0.98);
       let decel = brake ? brakeRate : 0;
@@ -1845,7 +2021,16 @@
         const coastDecel = baseDrag + ratioDrag * speedRatio;
         decel = Math.max(decel, coastDecel);
       }
-      let nextV = prevV + (effectiveAccel - decel) * dt;
+      const rawNetAccel = effectiveAccel - decel;
+      const prevNetAccel = Number.isFinite(d.netAccel) ? d.netAccel : rawNetAccel;
+      const directionFlip = rawNetAccel * prevNetAccel < -0.02;
+      let netAccel = rawNetAccel;
+      if (directionFlip) {
+        const alpha = clamp(dt / NET_ACCEL_FILTER_TAU, 0, 1);
+        netAccel = prevNetAccel + (rawNetAccel - prevNetAccel) * alpha;
+      }
+      d.netAccel = netAccel;
+      let nextV = prevV + netAccel * dt;
       if (nextV < 0) nextV = 0;
       if (nextV > topSpeed) nextV = topSpeed;
       const avgV = (prevV + nextV) * 0.5;
@@ -1855,8 +2040,14 @@
       const distanceToApex = apexInfo ? apexInfo.distance : Infinity;
       if (apexInfo && apexInfo.seg === seg && distanceToApex <= Math.max(1.5, prevV * dt)) {
         const apexSpeed = apexInfo.apexSpeed;
-        if (prevV > apexSpeed * 1.05) {
+        if (prevV > apexSpeed + APEX_SUCCESS_MARGIN_MS) {
           d.missedApex = (d.missedApex ?? 0) + 1;
+          if (!(d.apexOverspeedCorners instanceof Set)) {
+            d.apexOverspeedCorners = new Set();
+          }
+          if (Number.isFinite(seg?.cornerIndex)) {
+            d.apexOverspeedCorners.add(seg.cornerIndex);
+          }
           d.v = Math.min(d.v, apexSpeed);
         }
       }
@@ -1879,6 +2070,11 @@
           if (lapTime < fastestLapTime) fastestLapTime = lapTime;
         }
         d.lapStartTime = timeAfterStep;
+        if (d.apexOverspeedCorners instanceof Set) {
+          d.apexOverspeedCorners.clear();
+        } else {
+          d.apexOverspeedCorners = new Set();
+        }
         if (d.pitJustExited) {
           d.pitJustExited = false;
         } else if (d.pitLapDisplay > 0) {
@@ -2046,20 +2242,10 @@
   function renderSpeedGraph() {
     if (!speedGraphCanvas || !speedGraphCtx) return;
     if (!speedGraphCanvas.width || !speedGraphCanvas.height) resizeSpeedGraph();
-    const width = speedGraphCanvas.width;
-    const height = speedGraphCanvas.height;
-    if (!width || !height) return;
-
+    const layout = getSpeedGraphLayout();
+    if (!layout) return;
+    const { width, height, dpr, plotPadding, plotWidth, plotHeight } = layout;
     const ctx = speedGraphCtx;
-    const dpr = speedGraphState.dpr || Math.max(1, window.devicePixelRatio || 1);
-    const plotPadding = {
-      left: 52 * dpr,
-      right: 18 * dpr,
-      top: 22 * dpr,
-      bottom: 28 * dpr,
-    };
-    const plotWidth = Math.max(1, width - plotPadding.left - plotPadding.right);
-    const plotHeight = Math.max(1, height - plotPadding.top - plotPadding.bottom);
 
     const focus = getFocusDriver();
     const panelColor = getCSS('--panel') || '#13161b';
@@ -2074,6 +2260,7 @@
 
     const points = speedGraphState.points;
     const prevPoints = Array.isArray(speedGraphState.prevPoints) ? speedGraphState.prevPoints : [];
+    const hoverPoint = speedGraphHover.active ? speedGraphHover.point : null;
     let maxObserved = focus.carStats?.topSpeed ?? 340;
     const check = list => {
       for (const p of list) if (Number.isFinite(p?.speed) && p.speed > maxObserved) maxObserved = p.speed;
@@ -2130,6 +2317,7 @@
     ctx.textBaseline = 'top';
     ctx.font = `${10 * dpr}px system-ui`;
     ctx.fillStyle = 'rgba(147, 161, 179, 0.6)';
+    const overspeedCorners = (focus?.apexOverspeedCorners instanceof Set) ? focus.apexOverspeedCorners : null;
     if (cornerMarkers.length) {
       for (const marker of cornerMarkers) {
         const x = ratioFrom(marker.start) * plotWidth;
@@ -2151,7 +2339,8 @@
           ctx.setLineDash([]);
           if (Number.isFinite(marker.apexSpeed)) {
             const apexY = valueToY(marker.apexSpeed * 3.6);
-            ctx.fillStyle = 'rgba(200, 130, 255, 0.9)';
+            const isOverspeed = overspeedCorners?.has(marker.cornerIndex ?? marker.index);
+            ctx.fillStyle = isOverspeed ? 'rgba(255, 100, 120, 0.95)' : 'rgba(200, 130, 255, 0.9)';
             ctx.beginPath();
             ctx.arc(ax, apexY, 3 * dpr, 0, Math.PI * 2);
             ctx.fill();
@@ -2247,6 +2436,66 @@
     ctx.fillText('Throttle', 6 * dpr, pedalLegendThrottleY);
     ctx.fillStyle = 'rgba(255, 107, 107, 0.9)';
     ctx.fillText('Brake', 6 * dpr, pedalLegendBrakeY);
+
+    if (hoverPoint) {
+      const hoverRatio = clamp(speedGraphHover.ratio, 0, 1);
+      const hoverX = hoverRatio * plotWidth;
+      const hoverSpeed = Number.isFinite(hoverPoint.speed) ? hoverPoint.speed : 0;
+      const hoverY = valueToY(hoverSpeed);
+      ctx.save();
+      ctx.setLineDash([4 * dpr, 4 * dpr]);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+      ctx.lineWidth = 1 * dpr;
+      ctx.beginPath();
+      ctx.moveTo(hoverX, 0);
+      ctx.lineTo(hoverX, plotHeight);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+      ctx.beginPath();
+      ctx.arc(hoverX, hoverY, 3.2 * dpr, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+
+      const throttlePct = Math.round(clamp01(hoverPoint.throttle ?? 0) * 100);
+      const brakePct = Math.round(clamp01(hoverPoint.brake ?? 0) * 100);
+      const tooltipLines = [
+        `${Math.round(Math.max(0, hoverSpeed))} km/h`,
+        `Throttle ${throttlePct}%`,
+        `Brake ${brakePct}%`,
+      ];
+      ctx.save();
+      ctx.font = `${10 * dpr}px system-ui`;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      let boxWidth = 0;
+      for (const line of tooltipLines) {
+        boxWidth = Math.max(boxWidth, ctx.measureText(line).width);
+      }
+      const lineHeight = 12 * dpr;
+      const boxHeight = tooltipLines.length * lineHeight + 6 * dpr;
+      boxWidth += 12 * dpr;
+      let boxX = hoverX + 12 * dpr;
+      let boxY = hoverY - boxHeight - 8 * dpr;
+      if (boxX + boxWidth > plotWidth) boxX = hoverX - boxWidth - 12 * dpr;
+      if (boxX < 0) boxX = 0;
+      if (boxY < 0) boxY = hoverY + 10 * dpr;
+      if (boxY + boxHeight > plotHeight) boxY = plotHeight - boxHeight;
+      ctx.fillStyle = 'rgba(11, 13, 16, 0.85)';
+      ctx.strokeStyle = 'rgba(105, 226, 255, 0.55)';
+      ctx.lineWidth = 1 * dpr;
+      ctx.beginPath();
+      ctx.rect(boxX, boxY, boxWidth, boxHeight);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(231, 238, 247, 0.95)';
+      let textY = boxY + 3 * dpr;
+      for (const line of tooltipLines) {
+        ctx.fillText(line, boxX + 6 * dpr, textY);
+        textY += lineHeight;
+      }
+      ctx.restore();
+    }
 
     const lapPos = focus.finished ? TRACK_LENGTH_M - 1e-3 : ((focus.pos % TRACK_LENGTH_M) + TRACK_LENGTH_M) % TRACK_LENGTH_M;
     const progressX = ratioFrom(lapPos) * plotWidth;
@@ -2420,6 +2669,7 @@
       d.lastLapTime = null;
       d.bestLapTime = Infinity;
       d.lapTimes = [];
+      d.apexOverspeedCorners = new Set();
       d.finishTime = null;
       d.laneSmooth = 0;
       if (d.carStats) {
@@ -2460,6 +2710,8 @@
       d.intervalDisplay = '—';
       d.throttle = 0;
       d.brake = 0;
+      d.netAccel = 0;
+      d.apexOverspeedCorners = new Set();
       d.pedalPlan = null;
       d.previousApex = null;
       d.activeApex = null;
