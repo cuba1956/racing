@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **UI**: Added a session selector with Practice default and Race mode option, plus fixed graph sizing and lowered segment deformation.
-- **Simulation**: Replaced target speed model with pedal-based physics, introducing throttle/brake planning around apex speeds.
-- **Telemetry**: Extended speed trace to expose pedal inputs and overlay throttle/brake lines on the graph for live feedback.
-- **Tuning**: Added a lookahead resolution slider that scales driver anticipation timing in real-time for comparative testing.
+- **Racecraft**: Drivers now coast once they reach the apex speed and must scrub excess pace via an overshoot penalty before re-accelerating, producing more believable corner exits.
+- **Telemetry**: The pedal graph draws a turquoise baseline whenever the car is coasting, making apex management easy to spot in replays or live runs.
+- **Tyres**: Rebalanced the wear constant and compound multipliers so stint lengths better match real expectations (softs ≈7 laps, mediums ≈12, hards ≈17 by default) and tweaked overall degradation response.
+- **Lookahead**: Reduced the minimum anticipation interval to 10 ms and expanded the slider range (down to 0.25× base) so the player can sample ultra-fast reaction settings.

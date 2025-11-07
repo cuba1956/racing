@@ -87,7 +87,7 @@
         <option value="50">50×</option>
       </select>
       <label class="tiny" for="lookaheadScale">Lookahead: <span id="lookaheadValue">—</span></label>
-      <input id="lookaheadScale" type="range" min="0.5" max="2" step="0.05" value="1" />
+      <input id="lookaheadScale" type="range" min="0.25" max="2" step="0.05" value="1" />
       <button id="btnStart">Start</button>
       <button id="btnPauseResume" disabled>Pause</button>
       <button id="btnRestart" disabled>Restart</button>
@@ -180,15 +180,15 @@
   const VIEW_PADDING_PX = 36;
   const GRID_SPACING_M = 10;
   const GRID_LANE_FACTOR = 0.6;
-  const TYRE_DEGRADE_PER_M = 1/12000;
+  const TYRE_DEGRADE_PER_M = 1/17500;
   const OVERTAKE_SUCCESS_EPS = 0.5;
   const OVERTAKE_GAP_THRESHOLD = 6;
   const OVERTAKE_SUCCESS_PENALTY = { strength: 0.12, duration: 1.2 };
   const OVERTAKE_FAIL_PENALTY = { strength: 0.10, duration: 1.0 };
   const tyreCompounds = {
-    hard:   { wear: 1.0, grip: 1.0, accel: 1.0, life: 32 },
-    medium: { wear: 1.5, grip: 1.05, accel: 1.05, life: 22 },
-    soft:   { wear: 2.0, grip: 1.10, accel: 1.10, life: 14 }
+    hard:   { wear: 0.7, grip: 1.0,  accel: 1.0,  life: 17 },
+    medium: { wear: 1.0, grip: 1.05, accel: 1.05, life: 12 },
+    soft:   { wear: 1.7, grip: 1.10, accel: 1.10, life: 7 }
   };
   const PIT_LANE_TIME = 25;
   const teamPitStats = {
@@ -428,7 +428,7 @@
     const baseLookaheadMin = isPlayer ? 0.02 : 0.02;
     const baseLookaheadInterval = clamp(lerp(0.03, 0.18, 1 - anticipationSkill), baseLookaheadMin, 0.22);
     const lookaheadScaleForDriver = isPlayer ? lookaheadScale : 1;
-    const minLookaheadInterval = isPlayer ? 0.02 : 0.02;
+    const minLookaheadInterval = 0.01;
     const lookaheadInterval = clamp(baseLookaheadInterval * lookaheadScaleForDriver, minLookaheadInterval, 0.35);
     return {
       id: i,
@@ -491,9 +491,11 @@
       targetThrottle: 1,
       targetBrakeIntent: 0,
       brakingForApex: false,
+      coastingForApex: false,
       previousApex: null,
       activeApex: null,
-      brakePrediction: null
+      brakePrediction: null,
+      apexPenaltySpeed: null
     };
   }
   function currentSegment(x) {
@@ -605,6 +607,7 @@
     return clamp(minOut + (maxOut - minOut) * shaped, minOut, maxOut);
   }
   const APEX_SUCCESS_MARGIN_MS = 5 / 3.6;
+  const APEX_PENALTY_RELEASE_MARGIN_MS = 1 / 3.6;
   function throttleResponseMultiplier(throttleInput, speedRatio, seg) {
     const demand = clamp01(Number.isFinite(throttleInput) ? throttleInput : 0);
     if (demand <= 0) return 1;
@@ -657,6 +660,32 @@
     }
     driver.activeApex = activeApex;
     const previousApex = driver.previousApex;
+    const distToApex = apexTarget ? apexTarget.distance : Infinity;
+    const apexSpeedTarget = apexTarget ? apexTarget.apexSpeed : null;
+    let coastingForApex = driver.coastingForApex === true;
+    const wasBrakingForApex = driver.brakingForApex === true;
+    if (!apexTarget || !Number.isFinite(apexSpeedTarget)) {
+      coastingForApex = false;
+    } else if (distToApex <= 0) {
+      coastingForApex = false;
+    } else if (!coastingForApex && wasBrakingForApex && currentSpeed <= apexSpeedTarget + APEX_SUCCESS_MARGIN_MS) {
+      coastingForApex = true;
+    }
+    if (coastingForApex) {
+      driver.brakingForApex = false;
+    }
+    const penaltyTargetSpeed = Number.isFinite(driver.apexPenaltySpeed) ? driver.apexPenaltySpeed : null;
+    let apexPenaltyActive = false;
+    if (penaltyTargetSpeed != null) {
+      if (currentSpeed <= penaltyTargetSpeed + APEX_PENALTY_RELEASE_MARGIN_MS) {
+        driver.apexPenaltySpeed = null;
+      } else {
+        apexPenaltyActive = true;
+      }
+    }
+    if (apexPenaltyActive) {
+      coastingForApex = false;
+    }
     driver.lookaheadTimer = Math.max(0, (driver.lookaheadTimer ?? 0) - dt);
     if (driver.lookaheadTimer <= 0) {
       driver.lookaheadTimer = lookaheadInterval;
@@ -690,33 +719,37 @@
         }
       }
       if (apexTarget) {
-        const apexSpeed = apexTarget.apexSpeed;
+        const apexSpeed = Number.isFinite(apexSpeedTarget) ? apexSpeedTarget : 0;
         const horizon = LOOKAHEAD_METERS;
-        const distToApex = apexTarget.distance;
+        const distToApexNow = distToApex;
         let shouldBrake = false;
-        if (brakeRate > 0 && distToApex <= horizon) {
+        if (!coastingForApex && distToApexNow > 0 && brakeRate > 0 && distToApexNow <= horizon) {
           brakePrediction = predictBrakingTrajectory({
             speed: currentSpeed,
             targetSpeed: apexSpeed,
             brakeRate,
             step: Math.min(dt, TICK_RATE),
             maxTime: 6,
-            maxDistance: distToApex + 10,
+            maxDistance: distToApexNow + 10,
             initialNetAccel: driver.netAccel ?? 0,
             filterTau: NET_ACCEL_FILTER_TAU
           });
           const predictedDistance = brakePrediction?.distance ?? Infinity;
-          if (predictedDistance > Math.max(0, distToApex - 1.5)) {
+          if (predictedDistance > Math.max(0, distToApexNow - 1.5)) {
             shouldBrake = true;
           }
         }
         const currentlyBraking = !!driver.brakingForApex;
-        if (currentlyBraking) {
-          if (distToApex <= 0 || currentSpeed <= apexSpeed + APEX_SUCCESS_MARGIN_MS) {
-            driver.brakingForApex = false;
+        if (!coastingForApex) {
+          if (currentlyBraking) {
+            if (distToApexNow <= 0 || currentSpeed <= apexSpeed + APEX_SUCCESS_MARGIN_MS) {
+              driver.brakingForApex = false;
+            }
+          } else if (shouldBrake) {
+            driver.brakingForApex = true;
           }
-        } else if (shouldBrake) {
-          driver.brakingForApex = true;
+        } else {
+          driver.brakingForApex = false;
         }
         if (driver.brakingForApex) {
           brakeIntent = 1;
@@ -732,14 +765,31 @@
         const modulated = applyThrottleCurve(progress, throttleCurveInfo.curve, minOutput, throttleTarget);
         throttleTarget = Math.min(throttleTarget, modulated);
       }
+      if (coastingForApex) {
+        throttleTarget = 0;
+        brakeIntent = 0;
+      }
       driver.targetThrottle = throttleTarget;
       driver.targetBrakeIntent = brakeIntent;
       driver.brakePrediction = brakePrediction;
+    }
+    if (coastingForApex) {
+      driver.targetThrottle = 0;
+      driver.targetBrakeIntent = 0;
+      driver.brakePrediction = null;
+    }
+    if (apexPenaltyActive) {
+      // Overshoot penalty: stay on the brakes until we've scrubbed the excess speed.
+      driver.targetThrottle = 0;
+      driver.targetBrakeIntent = 1;
+      driver.brakePrediction = null;
+      driver.brakingForApex = false;
     }
     const throttleGoal = clamp(driver.targetThrottle ?? 1, 0, 1);
     const brakeGoal = clamp(driver.targetBrakeIntent ?? 0, 0, 1);
     driver.throttle = throttleGoal;
     driver.brake = brakeGoal;
+    driver.coastingForApex = coastingForApex;
     driver.pedalPlan = apexTarget;
     return {
       throttle: driver.throttle,
@@ -1023,7 +1073,8 @@
             x: 1,
             speed: prevPoint.speed,
             throttle: prevPoint.throttle ?? 0,
-            brake: prevPoint.brake ?? 0
+            brake: prevPoint.brake ?? 0,
+            coasting: prevPoint.coasting ?? 0
           });
         }
         speedGraphState.prevPoints = speedGraphState.points.slice(-SPEED_GRAPH_MAX_POINTS);
@@ -1037,16 +1088,18 @@
     const lastPoint = speedGraphState.points[speedGraphState.points.length - 1];
     const throttleVal = clamp01(focus.throttle ?? 0);
     const brakeVal = clamp01(focus.brake ?? 0);
+    const coastingVal = focus.coastingForApex ? 1 : 0;
     if (!lastPoint) {
-      speedGraphState.points.push({ x: progress, speed: speedKmh, throttle: throttleVal, brake: brakeVal });
+      speedGraphState.points.push({ x: progress, speed: speedKmh, throttle: throttleVal, brake: brakeVal, coasting: coastingVal });
     } else {
       const delta = progress - lastPoint.x;
       if (force || delta >= SPEED_GRAPH_MIN_STEP) {
-        speedGraphState.points.push({ x: progress, speed: speedKmh, throttle: throttleVal, brake: brakeVal });
+        speedGraphState.points.push({ x: progress, speed: speedKmh, throttle: throttleVal, brake: brakeVal, coasting: coastingVal });
       } else if (Math.abs(delta) <= SPEED_GRAPH_MIN_STEP * 0.5) {
         lastPoint.speed = speedKmh;
         lastPoint.throttle = throttleVal;
         lastPoint.brake = brakeVal;
+        lastPoint.coasting = coastingVal;
       }
     }
     speedGraphState.lastDriverId = focus.id;
@@ -1178,7 +1231,9 @@
       d.targetThrottle = 1;
       d.targetBrakeIntent = 0;
       d.brakingForApex = false;
+      d.coastingForApex = false;
       d.brakePrediction = null;
+      d.apexPenaltySpeed = null;
     }
   }
 
@@ -2048,7 +2103,10 @@
           if (Number.isFinite(seg?.cornerIndex)) {
             d.apexOverspeedCorners.add(seg.cornerIndex);
           }
-          d.v = Math.min(d.v, apexSpeed);
+          const overshoot = Math.max(0, prevV - apexSpeed);
+          const penaltyTarget = Math.max(0, prevV - overshoot);
+          const existingTarget = Number.isFinite(d.apexPenaltySpeed) ? d.apexPenaltySpeed : Infinity;
+          d.apexPenaltySpeed = Math.min(existingTarget, penaltyTarget);
         }
       }
       const change = nextV - prevV;
@@ -2427,6 +2485,33 @@
     drawPedalLine(points, p => clamp01(p.throttle ?? 0), 'rgba(123, 216, 143, 0.85)', 1.2 * dpr);
     drawPedalLine(points, p => clamp01(p.brake ?? 0), 'rgba(255, 107, 107, 0.85)', 1.2 * dpr);
 
+    if (Array.isArray(points) && points.length > 1) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(105, 226, 255, 0.95)';
+      ctx.lineWidth = 3 * dpr;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      let drawingSegment = false;
+      let drewAnything = false;
+      for (let i = 0; i < points.length; i++) {
+        const p = points[i];
+        if (!p.coasting) {
+          drawingSegment = false;
+          continue;
+        }
+        const x = clamp(p.x, 0, 1) * plotWidth;
+        const y = pedalBase;
+        if (!drawingSegment) {
+          ctx.moveTo(x, y);
+          drawingSegment = true;
+        }
+        ctx.lineTo(x, y);
+        drewAnything = true;
+      }
+      if (drewAnything) ctx.stroke();
+      ctx.restore();
+    }
+
     ctx.font = `${9 * dpr}px system-ui`;
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
@@ -2720,7 +2805,9 @@
       d.targetThrottle = 1;
       d.targetBrakeIntent = 0;
       d.brakingForApex = false;
+      d.coastingForApex = false;
       d.brakePrediction = null;
+      d.apexPenaltySpeed = null;
     });
     if (drivers.length) drivers[0].intervalDisplay = '+0.0 s';
     resetSpeedGraph(drivers[0] ?? null);
